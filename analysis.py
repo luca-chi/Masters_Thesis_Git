@@ -1,0 +1,8164 @@
+#!/usr/bin/env python3
+"""
+analysis.py
+
+Single-trajectory analysis script for HOOMD/GSD patchy-particle simulations.
+For MSD calculation, the code for now requires the prepare.py file to see whether
+the trajectory is a slab or a droplet simulation.
+
+Usage
+-----
+Basic:
+    python3 analysis.py elongation_kT_0.064_traj.gsd
+
+With plots:
+    python3 analysis.py elongation_kT_0.064_traj.gsd --plot
+
+Specify output directory:
+    python3 analysis.py elongation_kT_0.064_traj.gsd --output-dir analysis_outputs
+
+Specify species by type id or type name:
+    python3 analysis.py traj.gsd --density-species 0 1
+    python3 analysis.py traj.gsd --msd-species 3PPB_core
+    python3 analysis.py traj.gsd --rdf-species 3PPB_core
+
+RDF normalization methods:
+    python3 analysis.py traj.gsd                    # default: Freud built-in RDF normalization
+    python3 analysis.py traj.gsd --rdf-method scaled
+    python3 analysis.py traj.gsd --rdf-method density_normalized
+
+MSD methods:
+    python3 analysis.py traj.gsd                    # default: freud.msd.MSD(box, mode="window")
+    python3 analysis.py traj.gsd --msd-method freud_direct
+
+Specify explicit bond analysis:
+    python3 analysis.py traj.gsd --bond-type1 3PPB_PatchB --bond-type2 3PPB_PatchB --bond-dist 0.24
+
+3D density analysis (droplets and other non-slab morphologies):
+    python3 analysis.py traj.gsd --density-3d --plot
+    python3 analysis.py traj.gsd --density-3d --plot --density3d-sigma 1.2 --density3d-voxel 0.4
+    python3 analysis.py traj.gsd --density-3d --plot --density3d-views 20,45 20,135 80,0
+    python3 analysis.py traj.gsd --density-3d --plot --density3d-rotate
+    python3 analysis.py traj.gsd --density-3d --density3d-interactive
+
+    Outputs are written per core species (patches are always excluded), with the species in the file name and the
+    column headers, e.g. traj_type_0_3PPB_core_density3d_summary.csv.  When two
+    or more core species each have a condensate, a two-color 3D overlay and a
+    composite slice figure are written for every pair.
+
+Skip methods:
+    python3 analysis.py traj.gsd --skip-msd --skip-rdf
+
+Units:
+    CSVs, plots, and calculations use the project HOOMD unit convention directly:
+    nm for length, ps for time, amu for mass, and kJ/mol for energy/kT. Time axes
+    use TIME["dt"] from prepare.py, normally 0.001 ps/step.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import importlib.util
+import os
+import re
+import warnings
+
+import gsd.hoomd
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
+
+import freud
+import ruptures as rpt
+from scipy.ndimage import gaussian_filter, uniform_filter1d
+from tqdm import tqdm
+
+
+# =============================================================================
+# Basic helpers
+# =============================================================================
+
+
+def get_trajname(filename: str) -> str:
+    """Return filename without extension."""
+    return os.path.splitext(os.path.basename(filename))[0]
+
+
+def extract_kT_from_filename(filename: str):
+    """
+    Extract reduced temperature from filenames like:
+        elongation_kT_0.064_traj.gsd
+    """
+    basename = os.path.basename(filename)
+    match = re.search(r"kT_([-+]?\d*\.?\d+)", basename)
+    if match:
+        return float(match.group(1))
+    return np.nan
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_name(text) -> str:
+    """Make a string safe for filenames."""
+    return re.sub(r"[^A-Za-z0-9_.+-]+", "_", str(text))
+
+
+def open_traj(path: str):
+    return gsd.hoomd.open(path, mode="r")
+
+
+def get_type_names(frame) -> list[str]:
+    return list(frame.particles.types)
+
+
+def typeid_to_name(frame, typeid: int) -> str:
+    return get_type_names(frame)[int(typeid)]
+
+
+def name_to_typeid(frame, name: str) -> int:
+    names = get_type_names(frame)
+    if name not in names:
+        raise ValueError(f"Particle type name {name!r} not found. Available types: {names}")
+    return names.index(name)
+
+
+def parse_type_spec(frame, spec) -> int:
+    """
+    Parse a particle type specification.
+
+    Accepts:
+        - integer type id as int or numeric string
+        - particle type name as string
+    """
+    if isinstance(spec, int):
+        return spec
+
+    spec = str(spec)
+
+    if spec.isdigit():
+        return int(spec)
+
+    return name_to_typeid(frame, spec)
+
+
+def parse_type_specs(frame, specs) -> list[int]:
+    if specs is None:
+        return []
+    return [parse_type_spec(frame, s) for s in specs]
+
+
+def unique_preserve_order(values):
+    seen = set()
+    out = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def classify_type_name(type_name: str) -> str:
+    """
+    Heuristic classifier for types generated by simulation.py.
+
+    Expected examples:
+        3PPB_core       -> core
+        3PPB_PatchB     -> patch
+        Crowder         -> crowder
+        CrowderSmall    -> crowder
+    """
+    lower = type_name.lower()
+
+    if "patch" in lower:
+        return "patch"
+    if "crowder" in lower:
+        return "crowder"
+    if lower.endswith("_core") or lower == "core":
+        return "core"
+
+    return "unknown"
+
+
+def find_typeids_by_role(frame, role: str) -> list[int]:
+    names = get_type_names(frame)
+    return [i for i, name in enumerate(names) if classify_type_name(name) == role]
+
+
+def default_core_typeids(frame) -> list[int]:
+    cores = find_typeids_by_role(frame, "core")
+    if len(cores) > 0:
+        return cores
+
+    # Fallback: use first type.
+    return [0]
+
+
+def default_patch_typeids(frame) -> list[int]:
+    return find_typeids_by_role(frame, "patch")
+
+
+def all_typeids(frame) -> list[int]:
+    return list(range(len(get_type_names(frame))))
+
+
+def populated_typeids_from_gsd(frame) -> list[int]:
+    """Return particle type IDs that actually occur in this GSD frame."""
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    if typeids.size == 0:
+        return []
+    return [int(tid) for tid in np.unique(typeids)]
+
+
+def core_typeids_from_gsd(frame) -> list[int]:
+    """
+    Infer populated patchy-particle core types using only GSD contents.
+
+    Core-like names (``*_core`` or ``Core``) are sufficient for current
+    trajectories.  For older trajectories whose cores have names such as
+    ``3PP``, core types are also inferred from GSD bond topology: a populated
+    non-patch type bonded to a name-classified patch type is a core type.
+    Crowders and patches are never returned.
+    """
+    populated = populated_typeids_from_gsd(frame)
+    populated_set = set(populated)
+    names = get_type_names(frame)
+
+    cores = [
+        tid for tid in populated
+        if classify_type_name(names[tid]) == "core"
+    ]
+    patch_ids = {
+        tid for tid in populated
+        if classify_type_name(names[tid]) == "patch"
+    }
+
+    if patch_ids:
+        try:
+            groups = np.asarray(frame.bonds.group, dtype=int)
+        except Exception:
+            groups = np.empty((0, 2), dtype=int)
+
+        if groups.ndim == 2 and groups.shape[1] == 2 and groups.size:
+            particle_typeids = np.asarray(frame.particles.typeid, dtype=int)
+            for particle_a, particle_b in groups:
+                if not (
+                    0 <= int(particle_a) < particle_typeids.size
+                    and 0 <= int(particle_b) < particle_typeids.size
+                ):
+                    continue
+                type_a = int(particle_typeids[int(particle_a)])
+                type_b = int(particle_typeids[int(particle_b)])
+                for patch_type, other_type in ((type_a, type_b), (type_b, type_a)):
+                    if patch_type not in patch_ids or other_type not in populated_set:
+                        continue
+                    if classify_type_name(names[other_type]) in {"patch", "crowder"}:
+                        continue
+                    cores.append(other_type)
+
+    return unique_preserve_order(cores)
+
+
+def particle_diameters(frame) -> np.ndarray:
+    """
+    Return particle diameters. If absent or invalid, fall back to ones.
+    """
+    N = frame.particles.N
+
+    try:
+        d = np.asarray(frame.particles.diameter, dtype=float)
+        if d.shape[0] == N and np.all(np.isfinite(d)) and not np.allclose(d, 0):
+            return d
+    except Exception:
+        pass
+
+    return np.ones(N, dtype=float)
+
+
+def mean_diameter_by_type(frame) -> dict[int, float]:
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    diameters = particle_diameters(frame)
+
+    result = {}
+    for tid in np.unique(typeids):
+        vals = diameters[typeids == tid]
+        result[int(tid)] = float(np.mean(vals)) if vals.size else 1.0
+
+    return result
+
+
+def make_freud_box(frame):
+    return freud.box.Box.from_box(frame.configuration.box)
+
+
+# =============================================================================
+# Unit and prepare.py helpers
+# =============================================================================
+
+
+def find_prepare_file(traj_file=None, explicit_path=None):
+    """Locate prepare.py without requiring it to be imported as a package."""
+    candidates = []
+
+    if explicit_path:
+        candidates.append(explicit_path)
+
+    if traj_file:
+        traj_dir = os.path.abspath(os.path.dirname(traj_file) or ".")
+        candidates.extend([
+            os.path.join(traj_dir, "prepare.py"),
+            os.path.join(traj_dir, "prepare(2).py"),
+        ])
+        candidates.extend(sorted(glob.glob(os.path.join(traj_dir, "prepare*.py"))))
+
+    script_dir = os.path.abspath(os.path.dirname(__file__) or ".")
+    candidates.extend([
+        os.path.join(script_dir, "prepare.py"),
+        os.path.join(script_dir, "prepare(2).py"),
+        "prepare.py",
+        "prepare(2).py",
+    ])
+    candidates.extend(sorted(glob.glob(os.path.join(script_dir, "prepare*.py"))))
+    candidates.extend(sorted(glob.glob("prepare*.py")))
+
+    for candidate in unique_preserve_order(candidates):
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def load_prepare_config(path=None, traj_file=None):
+    """Read run/analysis metadata from prepare.py if available."""
+    prepare_path = find_prepare_file(traj_file=traj_file, explicit_path=path)
+
+    if prepare_path is None:
+        return {
+            "path": None,
+            "module": None,
+            "RUN": {},
+            "TIME": {},
+            "TIME_PROFILE": None,
+            "BOX": None,
+            "BEAD_TYPES": {},
+            "TEMPLATES": {},
+            "POPULATIONS": [],
+            "POLYMERS": [],
+        }
+
+    spec = importlib.util.spec_from_file_location("_analysis_prepare_config", prepare_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    BOX_descr = getattr(module, "BOX", {})
+
+    return {
+        "path": prepare_path,
+        "module": module,
+        "RUN": getattr(module, "RUN", {}) or {},
+        "TIME": getattr(module, "TIME", {}) or {},
+        "TIME_PROFILE": getattr(module, "TIME_PROFILE", None),
+        "BOX": BOX_descr,
+        "BEAD_TYPES": getattr(module, "BEAD_TYPES", {}) or {},
+        "TEMPLATES": getattr(module, "TEMPLATES", {}) or {},
+        "POPULATIONS": getattr(module, "POPULATIONS", []) or [],
+        "POLYMERS": getattr(module, "POLYMERS", []) or [],
+    }
+
+
+def get_dt_from_prepare(prepare_config, fallback=0.001):
+    """Return the HOOMD integration timestep in ps per MD step."""
+    try:
+        dt = float((prepare_config or {}).get("TIME", {}).get("dt", fallback))
+        if np.isfinite(dt) and dt > 0:
+            return dt
+    except Exception:
+        pass
+    return float(fallback)
+
+
+# Canonical unit convention for these simulations. HOOMD stores unitless
+# numbers, but this project uses the standard physical interpretation below:
+# length in nm, time in ps, mass in amu, and energy/temperature kT in kJ/mol.
+HOOMD_UNIT_LABELS = {
+    "length": "nm",
+    "time": "ps",
+    "mass": "amu",
+    "energy": "kJ/mol",
+    "temperature": "kJ/mol",
+    "volume": "nm^3",
+    "area": "nm^2",
+    "pressure": "kJ/mol/nm^3",
+    "diffusion": "nm^2/ps",
+}
+
+
+def get_unit_context(prepare_config=None):
+    """
+    Return the direct HOOMD unit context used by this project.
+
+    No extra reduced-unit conversion is applied. Positions, box lengths,
+    diameters, and RDF radii are read directly as nm; logged energies and kT
+    values are written as kJ/mol; masses are amu; and elapsed time is computed
+    from HOOMD timesteps using TIME["dt"] from prepare.py in ps/step.
+    """
+    return {
+        "labels": dict(HOOMD_UNIT_LABELS),
+        "scales": {"length": 1.0, "time": 1.0, "mass": 1.0, "energy": 1.0},
+        "raw": {"unit_system": "HOOMD:nm_ps_amu_kJ_per_mol"},
+    }
+
+
+def unit_label(quantity, prepare_config=None):
+    return get_unit_context(prepare_config)["labels"].get(quantity, quantity)
+
+
+def convert_quantity(values, quantity, prepare_config=None):
+    """Return values unchanged because analysis is already in HOOMD physical units."""
+    return np.asarray(values, dtype=float)
+
+
+def add_hoomd_unit_metadata(df, dt=None, prepare_config=None):
+    """Attach HOOMD unit labels to CSV outputs."""
+    df = df.copy()
+    labels = get_unit_context(prepare_config)["labels"]
+    df["unit_system"] = "HOOMD:nm_ps_amu_kJ_per_mol"
+    df["length_unit"] = labels["length"]
+    df["time_unit"] = labels["time"]
+    df["mass_unit"] = labels["mass"]
+    df["energy_unit"] = labels["energy"]
+    df["temperature_unit"] = labels["temperature"]
+    if dt is not None:
+        df["dt_ps_per_step"] = float(dt)
+    return df
+
+
+def timestep_to_hoomd_time(steps, dt):
+    return np.asarray(steps, dtype=float) * float(dt)
+
+
+def _template_patch_bead_types(template_name, templates):
+    template = templates.get(template_name, {}) if templates else {}
+    if template.get("kind") == "patchy":
+        return list(template.get("patches", []) or [])
+    return []
+
+
+def _population_active_patch_aliases(prepare_config):
+    """Infer active patch particle type names and their bead-type names from prepare.py."""
+    templates = (prepare_config or {}).get("TEMPLATES", {}) or {}
+    out = []
+
+    for pop in (prepare_config or {}).get("POPULATIONS", []) or []:
+        if int(pop.get("count", 0) or 0) <= 0:
+            continue
+        alias = pop.get("alias") or pop.get("template")
+        type_names = pop.get("type_names", {}) or {}
+        for bead_type in _template_patch_bead_types(pop.get("template"), templates):
+            patched_name = type_names.get("patch") or type_names.get(bead_type) or f"{alias}_{bead_type}"
+            out.append((patched_name, bead_type))
+
+    for poly in (prepare_config or {}).get("POLYMERS", []) or []:
+        if int(poly.get("count", 0) or 0) <= 0:
+            continue
+        for mon in poly.get("sequence", []) or []:
+            alias = mon.get("alias") or mon.get("template")
+            type_names = mon.get("type_names", {}) or {}
+            for bead_type in _template_patch_bead_types(mon.get("template"), templates):
+                patched_name = type_names.get("patch") or type_names.get(bead_type) or f"{alias}_{bead_type}"
+                out.append((patched_name, bead_type))
+
+    return unique_preserve_order(out)
+
+
+def patch_sigma_from_prepare(prepare_config, bead_type, fallback=np.nan):
+    bead_types = (prepare_config or {}).get("BEAD_TYPES", {}) or {}
+    try:
+        value = float((bead_types.get(bead_type, {}) or {}).get("sigma", fallback))
+        return value if np.isfinite(value) and value > 0 else fallback
+    except Exception:
+        return fallback
+
+
+
+def _template_core_bead_type(template_name, templates):
+    template = templates.get(template_name, {}) if templates else {}
+    if template.get("kind") == "patchy":
+        return template.get("core")
+    if template.get("kind") == "single_bead":
+        return template.get("bead")
+    return None
+
+
+def _actual_type_name_for_core_or_bead(alias, bead_type, template, type_names):
+    type_names = type_names or {}
+    if template.get("kind") == "single_bead":
+        return type_names.get("bead", alias)
+    if template.get("kind") == "patchy":
+        return type_names.get("core", f"{alias}_core")
+    return None
+
+
+def active_reference_core_typeids_from_prepare(frame, prepare_config=None):
+    """
+    Infer the active core/anchor species from prepare.py populations/polymers.
+
+    The GSD type list may contain registered but inactive types.  For density
+    and RDF region detection we want a core species that is actually populated.
+    """
+    if prepare_config is None:
+        return []
+    templates = prepare_config.get("TEMPLATES", {}) or {}
+    names = get_type_names(frame)
+    name_to_id = {name: i for i, name in enumerate(names)}
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    out = []
+
+    for pop in prepare_config.get("POPULATIONS", []) or []:
+        if int(pop.get("count", 0) or 0) <= 0:
+            continue
+        template = templates.get(pop.get("template"), {}) or {}
+        bead_type = _template_core_bead_type(pop.get("template"), templates)
+        if bead_type is None:
+            continue
+        alias = pop.get("alias") or pop.get("template")
+        tname = _actual_type_name_for_core_or_bead(alias, bead_type, template, pop.get("type_names", {}) or {})
+        if tname in name_to_id and np.any(typeids == name_to_id[tname]):
+            out.append(name_to_id[tname])
+
+    for poly in prepare_config.get("POLYMERS", []) or []:
+        if int(poly.get("count", 0) or 0) <= 0:
+            continue
+        for mon in poly.get("sequence", []) or []:
+            template = templates.get(mon.get("template"), {}) or {}
+            bead_type = _template_core_bead_type(mon.get("template"), templates)
+            if bead_type is None:
+                continue
+            alias = mon.get("alias") or mon.get("template")
+            tname = _actual_type_name_for_core_or_bead(alias, bead_type, template, mon.get("type_names", {}) or {})
+            if tname in name_to_id and np.any(typeids == name_to_id[tname]):
+                out.append(name_to_id[tname])
+
+    return unique_preserve_order(out)
+
+
+def default_reference_species(frame, prepare_config=None):
+    active = active_reference_core_typeids_from_prepare(frame, prepare_config=prepare_config)
+    if active:
+        return active[0]
+
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    for tid in default_core_typeids(frame):
+        if np.any(typeids == tid):
+            return tid
+
+    for tid in all_typeids(frame):
+        if np.any(typeids == tid):
+            return tid
+
+    return default_core_typeids(frame)[0]
+
+
+
+def _actual_type_name_for_template_bead(alias, bead_type, template, type_names):
+    """Map a prepare.py template bead name to the actual HOOMD particle type name."""
+    type_names = type_names or {}
+    if template.get("kind") == "single_bead":
+        return type_names.get("bead", alias)
+    if template.get("kind") == "patchy":
+        if bead_type == template.get("core"):
+            return type_names.get("core", f"{alias}_core")
+        return type_names.get(bead_type, f"{alias}_{bead_type}")
+    return None
+
+
+def _template_actual_type_names(template_name, alias, type_names, templates):
+    """Return all actual HOOMD type names created by one prepare.py template instance."""
+    template = (templates or {}).get(template_name, {}) or {}
+    if not template:
+        return []
+
+    if template.get("kind") == "single_bead":
+        bead = template.get("bead")
+        name = _actual_type_name_for_template_bead(alias, bead, template, type_names)
+        return [name] if name else []
+
+    if template.get("kind") == "patchy":
+        bead_names = [template.get("core")] + list(template.get("patches", []) or [])
+        names = []
+        for bead in bead_names:
+            name = _actual_type_name_for_template_bead(alias, bead, template, type_names)
+            if name:
+                names.append(name)
+        return unique_preserve_order(names)
+
+    return []
+
+
+def active_typeids_from_prepare(frame, prepare_config=None):
+    """
+    Infer particle type IDs with nonzero population from prepare.py.
+
+    Registered GSD particle types can include species whose prepare.py count is
+    zero.  This helper returns only types belonging to POPULATIONS/POLYMERS with
+    count > 0, while preserving any active type aliases used by templates.
+    """
+    cfg = prepare_config or {}
+    if cfg.get("path") is None and not cfg.get("POPULATIONS") and not cfg.get("POLYMERS"):
+        return None
+
+    templates = cfg.get("TEMPLATES", {}) or {}
+    active_names = []
+
+    for pop in cfg.get("POPULATIONS", []) or []:
+        try:
+            count = int(pop.get("count", 0) or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            continue
+        alias = pop.get("alias") or pop.get("template")
+        active_names.extend(
+            _template_actual_type_names(
+                pop.get("template"),
+                alias,
+                pop.get("type_names", {}) or {},
+                templates,
+            )
+        )
+
+    for poly in cfg.get("POLYMERS", []) or []:
+        try:
+            count = int(poly.get("count", 0) or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            continue
+        for mon in poly.get("sequence", []) or []:
+            alias = mon.get("alias") or mon.get("template")
+            active_names.extend(
+                _template_actual_type_names(
+                    mon.get("template"),
+                    alias,
+                    mon.get("type_names", {}) or {},
+                    templates,
+                )
+            )
+
+    active_names = unique_preserve_order([name for name in active_names if name])
+    if not active_names:
+        return None
+
+    frame_names = get_type_names(frame)
+    name_to_id = {name: i for i, name in enumerate(frame_names)}
+    active_ids = [name_to_id[name] for name in active_names if name in name_to_id]
+    return unique_preserve_order(active_ids)
+
+
+def filter_density_output_species(frame, species_ids, prepare_config=None):
+    """Filter density CSV/plot species to nonzero prepare.py populations only."""
+    species_ids = [int(s) for s in species_ids]
+    active_ids = active_typeids_from_prepare(frame, prepare_config=prepare_config)
+    if active_ids is None:
+        return species_ids
+
+    active_set = set(active_ids)
+    filtered = [s for s in species_ids if s in active_set]
+    skipped = [s for s in species_ids if s not in active_set]
+    if skipped:
+        skipped_txt = ", ".join(f"{s}:{typeid_to_name(frame, s)}" for s in skipped if 0 <= int(s) < len(get_type_names(frame)))
+        if skipped_txt:
+            print(f"Skipping zero-population density output species from prepare.py: {skipped_txt}")
+    return filtered
+
+
+# =============================================================================
+# Low/high density region detection
+# =============================================================================
+
+
+def calculate_low_high_avg_v2(df, transition_buffer=10, smooth_window=9):
+    """
+    Detect low/high regions with the old working ruptures setup.
+
+    Expected order for a slab along x:
+        low_density1, transition1, high_density, transition2, low_density2
+
+    This intentionally uses Binseg(model="l2") with n_bkps=4, matching the
+    working reference code supplied in the prompt.  The highest-mean segment is
+    assigned to the dense phase; low density is measured outside a buffer around
+    that segment.
+    """
+    x_positions = df.iloc[:, 0].to_numpy(dtype=float)
+    densities = df.iloc[:, 1:]
+
+    if len(x_positions) < 8 or densities.shape[1] == 0:
+        return None, None, None, None, None, None, None, None
+
+    signal = densities.mean(axis=1).to_numpy(dtype=float)
+    if not np.all(np.isfinite(signal)):
+        med = np.nanmedian(signal)
+        signal = np.where(np.isfinite(signal), signal, med)
+
+    smooth_window = max(1, int(smooth_window))
+    smoothed = uniform_filter1d(signal, size=smooth_window, mode="nearest")
+
+    model = rpt.Binseg(model="l2").fit(smoothed)
+    model_dynp = rpt.Dynp(model="l2").fit(smoothed)          # Optional: trying the dynamic programming model
+    try:
+        bkps = model.predict(n_bkps=4)
+    except Exception:
+        return None, None, None, None, None, None, None, None
+
+    segments = []
+    start = 0
+    for end in bkps:
+        if end <= start:
+            continue
+        avg = float(smoothed[start:end].mean())
+        x1 = float(x_positions[start])
+        x2 = float(x_positions[end - 1])
+        segments.append((avg, x1, x2, start, end))
+        start = end
+
+    if not segments:
+        return None, None, None, None, None, None, None, None
+
+    segments = sorted(
+        segments,
+        key=lambda seg: (seg[0], -abs(seg[2] - seg[1])),
+        reverse=True,
+    )
+    high_segment = segments[0]
+    x_in_min = high_segment[1]
+    x_in_max = high_segment[2]
+    buffer_min = x_in_min - float(transition_buffer)
+    buffer_max = x_in_max + float(transition_buffer)
+
+    box_left = float(x_positions[0])
+    box_right = float(x_positions[-1])
+    buffer_min = max(box_left, buffer_min)
+    buffer_max = min(box_right, buffer_max)
+
+    low_mask = (
+        ((x_positions >= box_left) & (x_positions < buffer_min))
+        | ((x_positions > buffer_max) & (x_positions <= box_right))
+    )
+    high_mask = (x_positions >= x_in_min) & (x_positions <= x_in_max)
+
+    low_region = densities[low_mask]
+    high_region = densities[high_mask]
+
+    low_mean = low_region.mean().mean() if not low_region.empty else None
+    high_mean = high_region.mean().mean() if not high_region.empty else None
+
+    return low_mean, high_mean, x_in_min, x_in_max, box_left, box_right, buffer_min, buffer_max
+
+
+def average_profile_region(x, y, x_min, x_max):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    mask = (x >= x_min) & (x <= x_max)
+
+    if np.sum(mask) == 0:
+        return np.nan
+
+    return float(np.nanmean(y[mask]))
+
+
+def average_profile_outside_regions(x, y, box_left, box_right, buffer_min, buffer_max):
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    mask = (
+        ((x >= box_left) & (x < buffer_min))
+        | ((x > buffer_max) & (x <= box_right))
+    )
+
+    if np.sum(mask) == 0:
+        return np.nan
+
+    return float(np.nanmean(y[mask]))
+
+
+# =============================================================================
+# Observables
+# =============================================================================
+
+
+LOG_KEYS = {
+    "kinetic_temperature": "md/compute/ThermodynamicQuantities/kinetic_temperature",
+    "pressure": "md/compute/ThermodynamicQuantities/pressure",
+    "volume": "md/compute/ThermodynamicQuantities/volume",
+    "potential_energy": "md/compute/ThermodynamicQuantities/potential_energy",
+    "kinetic_energy": "md/compute/ThermodynamicQuantities/kinetic_energy",
+}
+
+
+def _get_log_value(frame, key):
+    value = frame.log[key]
+
+    if np.isscalar(value):
+        return value
+
+    value = np.asarray(value)
+
+    if value.size == 1:
+        return value.item()
+
+    return value
+
+
+def read_observables_from_traj(traj, dt=0.001) -> pd.DataFrame:
+    """
+    Read thermodynamic observables from a GSD trajectory.
+
+    If log quantities are absent, this still returns a DataFrame containing Time.
+    """
+    data = {"step": [], "time_ps": []}
+
+    for col in LOG_KEYS:
+        data[col] = []
+
+    available_keys = set(traj[0].log.keys()) if len(traj) else set()
+
+    for frame in tqdm(traj, desc="Reading observables", leave=False):
+        data["step"].append(frame.configuration.step)
+        data["time_ps"].append(float(frame.configuration.step) * float(dt))
+
+        for col, key in LOG_KEYS.items():
+            if key in frame.log:
+                data[col].append(_get_log_value(frame, key))
+            else:
+                data[col].append(np.nan)
+
+    df = pd.DataFrame(data)
+
+    missing = [col for col, key in LOG_KEYS.items() if key not in available_keys]
+    if missing:
+        warnings.warn(
+            "Some observable log fields were not found in the GSD. "
+            f"Missing columns will be NaN: {missing}"
+        )
+
+    return df
+
+
+def analyze_observables(traj_file, output_dir=".", plot=False, dt=0.001, prepare_config=None):
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+
+    with open_traj(traj_file) as traj:
+        df = read_observables_from_traj(traj, dt=dt)
+
+    df["trajname"] = trajname
+    df = add_hoomd_unit_metadata(df, dt=dt, prepare_config=prepare_config)
+
+    csv_path = os.path.join(output_dir, f"{trajname}_observables.csv")
+    df.to_csv(csv_path, index=False)
+
+    if plot:
+        cols = [
+            "kinetic_temperature",
+            "pressure",
+            "volume",
+            "potential_energy",
+            "kinetic_energy",
+        ]
+
+        fig, axs = plt.subplots(3, 2, figsize=(14, 10), dpi=200)
+        axs = axs.flatten()
+
+        ylabel_by_col = {
+            "kinetic_temperature": f"kinetic temperature [{unit_label('temperature', prepare_config)}]",
+            "pressure": f"pressure [{unit_label('pressure', prepare_config)}]",
+            "volume": f"volume [{unit_label('volume', prepare_config)}]",
+            "potential_energy": f"potential energy [{unit_label('energy', prepare_config)}]",
+            "kinetic_energy": f"kinetic energy [{unit_label('energy', prepare_config)}]",
+        }
+
+        for ax, col in zip(axs[:5], cols):
+            ax.plot(df["time_ps"], df[col])
+            ax.set_xlabel(f"time [{unit_label('time', prepare_config)}]")
+            ax.set_ylabel(ylabel_by_col.get(col, f"{col}"))
+            finite_vals = df[col].to_numpy(dtype=float)
+            finite_vals = finite_vals[np.isfinite(finite_vals)]
+            if finite_vals.size > 0:
+                n_tail = max(1, int(np.ceil(0.25 * finite_vals.size)))
+                avg_tail = float(np.nanmean(finite_vals[-n_tail:]))
+                ax.axhline(avg_tail, linestyle="--", linewidth=1.2, alpha=0.75)
+                ax.text(
+                    0.98,
+                    0.98,
+                    f"last 25% avg = {avg_tail:.4g}",
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+                )
+            ax.grid(alpha=0.3)
+
+        axs[5].axis("off")
+        fig.suptitle(f"{trajname} observables")
+        fig.tight_layout()
+
+        svg_path = os.path.join(output_dir, f"{trajname}_observables.svg")
+        fig.savefig(svg_path, bbox_inches="tight")
+        plt.close(fig)
+
+    return df
+
+
+# =============================================================================
+# Density profiles and single-temperature high/low density
+# =============================================================================
+
+
+def analyze_density_profile(
+    traj_file,
+    species_ids=None,
+    reference_species=None,
+    n_bins=100,
+    top_percentage=0.0,
+    transition_buffer=10,
+    smooth_window=9,
+    output_dir=".",
+    plot=False,
+    prepare_config=None,
+    last_frames=10,
+    per_frame=True,
+    min_contrast=1.5,
+    max_width_fraction=0.9,
+):
+    """
+    Compute x-dependent volume-fraction profiles for one trajectory.
+
+    Uses particle diameters stored in the GSD, so it works with the generic
+    simulation.py type system.
+
+    last_frames=N uses exactly the final N frames instead of top_percentage.
+
+    per_frame=True follows a mobile slab: every frame is shifted along x so the
+    reference species' periodic center of mass sits at x=0, the dense region is
+    detected in that frame alone, and the dense/dilute volume fractions are
+    measured in that frame.  low_vf/high_vf then hold the mean over the frames
+    where the slab was detected, with the sample std (ddof=1) alongside.  The
+    averaged profile and plot are built from the same recentered frames.
+    """
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+
+        if species_ids is None:
+            species_ids = all_typeids(first)
+
+        species_ids = [int(s) for s in species_ids]
+
+        if reference_species is None:
+            reference_species = default_reference_species(first, prepare_config=prepare_config)
+        reference_species = int(reference_species)
+
+        n_frames = len(traj)
+        start_frame, end_frame = density3d_frame_range(
+            n_frames, top_percentage, last_frames=last_frames
+        )
+        frame_indices = range(start_frame, end_frame)
+
+        frame0 = traj[start_frame]
+        Lx, Ly, Lz = frame0.configuration.box[:3]
+
+        bins = np.linspace(-Lx / 2, Lx / 2, n_bins + 1)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])
+        bin_width = Lx / n_bins
+        bin_volume = Ly * Lz * bin_width
+        box_volume = Lx * Ly * Lz
+
+        vf = {s: np.zeros(n_bins, dtype=float) for s in species_ids}
+        whole_box_vf = {s: 0.0 for s in species_ids}
+
+        frames_used = 0
+        per_frame_profiles = []   # [(frame index, timestep, {species: profile})]
+
+        for i in tqdm(frame_indices, desc="Density profile", leave=False):
+            frame = traj[i]
+            positions = np.asarray(frame.particles.position, dtype=float)
+            typeids = np.asarray(frame.particles.typeid, dtype=int)
+            diameters = particle_diameters(frame)
+            x_positions = positions[:, 0]
+
+            if per_frame:
+                # Put the slab of the reference species at x = 0 in this frame.
+                ref_mask = typeids == reference_species
+                if np.any(ref_mask):
+                    ref_volumes = (np.pi / 6.0) * diameters[ref_mask] ** 3
+                    center_x = periodic_center_of_mass(
+                        positions[ref_mask], np.array([Lx, Ly, Lz], dtype=float),
+                        weights=ref_volumes,
+                    )[0]
+                    x_positions = _wrap_to_box(x_positions - center_x, Lx)
+
+            frame_vf = {}
+            for s in species_ids:
+                mask = typeids == s
+                if not np.any(mask):
+                    frame_vf[s] = np.zeros(n_bins, dtype=float)
+                    continue
+
+                particle_volumes = (np.pi / 6.0) * diameters[mask] ** 3
+                mean_particle_volume = float(np.mean(particle_volumes))
+
+                hist, _ = np.histogram(x_positions[mask], bins=bins)
+
+                frame_vf[s] = hist * mean_particle_volume / bin_volume
+                vf[s] += frame_vf[s]
+                whole_box_vf[s] += float(np.sum(particle_volumes) / box_volume)
+
+            if per_frame:
+                try:
+                    step = int(frame.configuration.step)
+                except (AttributeError, TypeError):
+                    step = -1
+                per_frame_profiles.append((int(i), step, frame_vf))
+
+            frames_used += 1
+
+        if frames_used == 0:
+            raise RuntimeError("No frames were available for density analysis.")
+
+        for s in species_ids:
+            vf[s] /= frames_used
+            whole_box_vf[s] /= frames_used
+
+    # Detect dense region from reference species volume fraction.
+    ref_df = pd.DataFrame({
+        "X": bin_centers,
+        f"Species {reference_species}": vf[reference_species],
+    })
+
+    (
+        ref_low,
+        ref_high,
+        x_in_min,
+        x_in_max,
+        box_left,
+        box_right,
+        buffer_min,
+        buffer_max,
+    ) = calculate_low_high_avg_v2(
+        ref_df,
+        transition_buffer=transition_buffer,
+        smooth_window=smooth_window,
+    )
+
+    output_species_ids = filter_density_output_species(first, species_ids, prepare_config=prepare_config)
+
+    profile_df = pd.DataFrame({"x_nm": bin_centers})
+
+    for s in output_species_ids:
+        type_name = typeid_to_name(first, s)
+        profile_df[f"type_{s}_{safe_name(type_name)}_volume_fraction"] = vf[s]
+        profile_df[f"type_{s}_{safe_name(type_name)}_whole_box_vf"] = whole_box_vf[s]
+
+    profile_df["trajname"] = trajname
+    profile_df["kT_kJ_per_mol"] = kT
+    profile_df = add_hoomd_unit_metadata(profile_df, prepare_config=prepare_config)
+
+    profile_csv = os.path.join(output_dir, f"{trajname}_density.csv")
+    profile_df.to_csv(profile_csv, index=False)
+
+    # --- Optional: slab re-detected frame by frame ---------------------------
+    per_frame_stats = {}
+    if per_frame:
+        frame_rows = []
+        for index, step, frame_vf in per_frame_profiles:
+            det = detect_dense_region_1d(
+                bin_centers, frame_vf[reference_species],
+                transition_buffer=transition_buffer,
+                smooth_window=smooth_window,
+                min_contrast=min_contrast,
+                max_width_fraction=max_width_fraction,
+            )
+            found = np.isfinite(det["in_min"]) and np.isfinite(det["in_max"])
+            for s in output_species_ids:
+                if found:
+                    dense = average_profile_region(
+                        bin_centers, frame_vf[s], det["in_min"], det["in_max"]
+                    )
+                    dilute = average_profile_outside_regions(
+                        bin_centers, frame_vf[s], det["box_left"], det["box_right"],
+                        det["buffer_min"], det["buffer_max"],
+                    )
+                else:
+                    dense = dilute = np.nan
+                frame_rows.append({
+                    "frame": index,
+                    "timestep": step,
+                    "typeid": s,
+                    "type_name": typeid_to_name(first, s),
+                    "dense_vf": dense,
+                    "dilute_vf": dilute,
+                    "detected": bool(det["detected"]),
+                    "detection_note": det["reason"],
+                    "contrast": det["contrast"],
+                    "x_in_min": det["in_min"],
+                    "x_in_max": det["in_max"],
+                    "x_width_nm": (det["in_max"] - det["in_min"]) if found else np.nan,
+                    "dense_volume_nm3": (
+                        (det["in_max"] - det["in_min"]) * Ly * Lz if found else np.nan
+                    ),
+                    "buffer_min": det["buffer_min"],
+                    "buffer_max": det["buffer_max"],
+                })
+
+        frames_df = pd.DataFrame(frame_rows)
+        frames_df["trajname"] = trajname
+        frames_df["kT_kJ_per_mol"] = kT
+        frames_df["reference_typeid"] = reference_species
+        frames_df.to_csv(os.path.join(output_dir, f"{trajname}_density_frames.csv"), index=False)
+
+        for s in output_species_ids:
+            rows_s = frames_df[(frames_df["typeid"] == s) & frames_df["detected"]]
+            high_mean, high_std = _frame_mean_std(rows_s["dense_vf"].to_numpy())
+            low_mean, low_std = _frame_mean_std(rows_s["dilute_vf"].to_numpy())
+            width_mean, width_std = _frame_mean_std(rows_s["x_width_nm"].to_numpy())
+            vol_mean, vol_std = _frame_mean_std(rows_s["dense_volume_nm3"].to_numpy())
+            per_frame_stats[s] = {
+                "high_vf_mean": high_mean, "high_vf_std": high_std,
+                "low_vf_mean": low_mean, "low_vf_std": low_std,
+                "x_width_mean": width_mean, "x_width_std": width_std,
+                "dense_volume_mean": vol_mean, "dense_volume_std": vol_std,
+                "n_detected": int(len(rows_s)),
+            }
+        n_ok = int(frames_df.loc[frames_df["typeid"] == output_species_ids[0], "detected"].sum()) if output_species_ids else 0
+        print(f"Per-frame slab detection: slab found in {n_ok}/{frames_used} frames")
+
+    summary_records = []
+
+    for s in output_species_ids:
+        type_name = typeid_to_name(first, s)
+        y = vf[s]
+
+        if x_in_min is not None:
+            low_vf = average_profile_outside_regions(
+                bin_centers,
+                y,
+                box_left,
+                box_right,
+                buffer_min,
+                buffer_max,
+            )
+            high_vf = average_profile_region(bin_centers, y, x_in_min, x_in_max)
+        else:
+            low_vf = np.nan
+            high_vf = np.nan
+
+        if per_frame:
+            pf = per_frame_stats[s]
+            phase_columns = {
+                "low_vf": pf["low_vf_mean"],
+                "high_vf": pf["high_vf_mean"],
+                "low_vf_mean": pf["low_vf_mean"],
+                "low_vf_std": pf["low_vf_std"],
+                "high_vf_mean": pf["high_vf_mean"],
+                "high_vf_std": pf["high_vf_std"],
+                "x_width_nm": pf["x_width_mean"],
+                "x_width_nm_std": pf["x_width_std"],
+                "dense_volume_nm3": pf["dense_volume_mean"],
+                "dense_volume_nm3_std": pf["dense_volume_std"],
+                "n_frames_detected": pf["n_detected"],
+            }
+        else:
+            phase_columns = {
+                "low_vf": low_vf,
+                "high_vf": high_vf,
+                "low_vf_mean": low_vf,
+                "low_vf_std": np.nan,
+                "high_vf_mean": high_vf,
+                "high_vf_std": np.nan,
+                "x_width_nm": x_in_max - x_in_min,
+                "x_width_nm_std": np.nan,
+                "dense_volume_nm3": (x_in_max - x_in_min) * Ly * Lz,
+                "dense_volume_nm3_std": np.nan,
+                "n_frames_detected": np.nan,
+            }
+
+        summary_records.append({
+            "trajname": trajname,
+            "kT_kJ_per_mol": kT,
+            "typeid": s,
+            "type_name": type_name,
+            "reference_typeid": reference_species,
+            "reference_type_name": typeid_to_name(first, reference_species),
+            "whole_box_vf": whole_box_vf[s],
+            **phase_columns,
+            "per_frame_redetection": bool(per_frame),
+            "n_frames_averaged": frames_used,
+            "first_frame_averaged": start_frame,
+            "last_frame_averaged": end_frame - 1,
+            "last_frames": last_frames if last_frames is not None else np.nan,
+            # Values from the single detection on the window-averaged profile.
+            "low_vf_window_profile": low_vf,
+            "high_vf_window_profile": high_vf,
+            "x_in_min": x_in_min,
+            "x_in_max": x_in_max,
+            "box_left": box_left,
+            "box_right": box_right,
+            "buffer_min": buffer_min,
+            "buffer_max": buffer_max,
+            "top_percentage": top_percentage,
+            "n_bins": n_bins,
+        })
+
+    summary_df = pd.DataFrame(summary_records)
+    summary_df = add_hoomd_unit_metadata(summary_df, prepare_config=prepare_config)
+    summary_csv = os.path.join(output_dir, f"{trajname}_density_summary.csv")
+    summary_df.to_csv(summary_csv, index=False)
+
+    if plot:
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=200)
+
+        for s in output_species_ids:
+            type_name = typeid_to_name(first, s)
+            ax.plot(bin_centers, vf[s], label=f"{s}: {type_name}")
+
+        if x_in_min is not None:
+            ax.axvspan(box_left, buffer_min, color="gray", alpha=0.20, label="Low density")
+            ax.axvspan(x_in_min, x_in_max, color="red", alpha=0.25, label="High density")
+            ax.axvspan(buffer_max, box_right, color="gray", alpha=0.20)
+            ax.axvline(x_in_min, color="black", linestyle="--")
+            ax.axvline(x_in_max, color="black", linestyle="--")
+
+            phase_lines = []
+            for _, row in summary_df.iterrows():
+                phase_lines.append(
+                    f"{int(row['typeid'])} {row['type_name']}: "
+                    f"dense VF={row['high_vf']:.4g}, dilute VF={row['low_vf']:.4g}"
+                )
+            if phase_lines:
+                ax.text(
+                    0.02,
+                    0.98,
+                    "\n".join(phase_lines),
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+                )
+
+        ax.set_xlabel(f"x [{unit_label('length', prepare_config)}]")
+        ax.set_ylabel("volume fraction [dimensionless]")
+        ax.set_title(f"{trajname} density profile")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+
+        svg_path = os.path.join(output_dir, f"{trajname}_density.svg")
+        fig.savefig(svg_path, bbox_inches="tight")
+        plt.close(fig)
+
+    return profile_df, summary_df
+
+
+# =============================================================================
+# 3D density analysis (density3d)
+#
+# Motivation
+# ----------
+# analyze_density_profile() assumes a slab along x: one dense region flanked by
+# two dilute regions.  For droplets, micelles, or multi-blob morphologies that
+# assumption fails, so this section:
+#
+#   1. builds volume-fraction profiles along x, y and z (optionally after
+#      recentering each frame on the periodic center of mass of the reference
+#      species, so a drifting or boundary-straddling condensate does not smear),
+#   2. detects the dense region along each axis with the same ruptures Binseg
+#      logic used by the slab code (calculate_low_high_avg_v2), separately for
+#      every analyzed species,
+#   3. defines each species' condensate as the intersection of its three dense
+#      ranges -- an axis-aligned cuboid -- and reports the mean volume fraction
+#      inside that cuboid as the dense-phase density for the phase diagram,
+#   4. builds a genuine 3D concentration field per species from the raw particle
+#      positions of a single frame by Gaussian-smearing particle volumes onto a
+#      grid, and renders only the voxels above a threshold derived from that
+#      species' 1D profiles.
+#
+# The 3D field is never built from the 1D projections.  The projections only
+# supply the color threshold.
+#
+# Per-species regions
+# -------------------
+# Every analyzed species is detected independently, because two core species may
+# form separate condensates; measuring species B inside species A's cuboid would
+# then be meaningless.  Where a species has no condensate of its own it falls
+# back to the reference species' cuboid, and the summary records which region was
+# used in `region_source`.  --density3d-shared-region forces every species into
+# the reference cuboid instead.
+#
+# Outputs are written one file per species, with the species in both the file
+# name and the column headers, following the same convention as the RDF outputs:
+#     {trajname}_type_{id}_{type_name}_density3d_profiles.csv
+#     {trajname}_type_{id}_{type_name}_density3d_summary.csv
+#     {trajname}_type_{id}_{type_name}_density3d_field.png
+#
+# Known caveats, stated up front because they affect interpretation:
+#   * The cuboid may either circumscribe the condensate or be inscribed in it.
+#     A sphere inscribed in a cube fills pi/6 ~= 0.52 of it, so a circumscribing
+#     cuboid biases the density low; Binseg's fixed four breakpoints usually
+#     produce the opposite, a cuboid inside the plateau, which samples the
+#     interior and excludes the interface.  field_occupancy_of_region tells you
+#     which regime you are in: ~0.5 means circumscribing, >1 means inscribed.
+#   * A 1D profile at fixed x averages over the whole y-z plane, so it mixes
+#     condensate with vapor and underestimates the local dense density.  The
+#     refinement pass (on by default) recomputes each axis profile using only
+#     particles inside that species' other two dense ranges, which turns a plane
+#     average into a local density.
+#   * Binseg always returns the requested number of breakpoints, so a
+#     homogeneous system still yields a "dense" segment.  Every axis is
+#     therefore quality-checked on contrast and width and can be marked
+#     undetected instead of producing a spurious data point.
+# =============================================================================
+
+
+DENSITY3D_AXIS_NAMES = ("x", "y", "z")
+DENSITY3D_DEFAULT_VIEWS = ((20.0, 45.0), (20.0, 135.0), (20.0, 225.0), (65.0, 45.0))
+
+# Palette for side-by-side species comparisons, in assignment order.
+DENSITY3D_SPECIES_COLORS = (
+    (0.15, 0.75, 0.95),   # cyan
+    (1.00, 0.50, 0.10),   # orange
+    (0.65, 0.35, 0.95),   # violet
+    (0.35, 0.90, 0.40),   # green
+)
+
+
+def _wrap_to_box(values, length):
+    """Wrap coordinates into [-length/2, +length/2)."""
+    length = float(length)
+    if length <= 0:
+        return np.asarray(values, dtype=float)
+    return (np.asarray(values, dtype=float) + 0.5 * length) % length - 0.5 * length
+
+
+def species_tag(typeid, type_name):
+    """File-name and column-name tag for one species, matching the RDF outputs."""
+    return f"type_{int(typeid)}_{safe_name(type_name)}"
+
+
+def periodic_center_of_mass(coords, box_lengths, weights=None, n_iter=2):
+    """
+    Periodic-aware center of mass. Found by mapping the coordoinates to a circle.
+
+    Starts from the circular mean along each axis (correct even when the
+    condensate straddles a periodic boundary), then refines with a couple of
+    wrapped-displacement iterations, which sharpens the estimate for compact
+    objects.
+    """
+    coords = np.asarray(coords, dtype=float)
+    box_lengths = np.asarray(box_lengths, dtype=float)
+    center = np.zeros(3, dtype=float)
+
+    if coords.ndim != 2 or coords.shape[0] == 0:
+        return center
+
+    if weights is None:
+        w = np.ones(coords.shape[0], dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape[0] != coords.shape[0]:
+            w = np.ones(coords.shape[0], dtype=float)
+
+    w_sum = float(np.sum(w))
+    if not np.isfinite(w_sum) or w_sum <= 0:
+        w = np.ones(coords.shape[0], dtype=float)
+        w_sum = float(coords.shape[0])
+
+    for axis in range(3):
+        length = float(box_lengths[axis])
+        if length <= 0:
+            continue
+        theta = 2.0 * np.pi * coords[:, axis] / length
+        sin_mean = float(np.sum(w * np.sin(theta)) / w_sum)
+        cos_mean = float(np.sum(w * np.cos(theta)) / w_sum)
+        if abs(sin_mean) < 1e-12 and abs(cos_mean) < 1e-12:
+            center[axis] = 0.0
+        else:
+            center[axis] = length * np.arctan2(sin_mean, cos_mean) / (2.0 * np.pi)
+
+    for _ in range(max(0, int(n_iter))):
+        for axis in range(3):
+            length = float(box_lengths[axis])
+            if length <= 0:
+                continue
+            delta = _wrap_to_box(coords[:, axis] - center[axis], length)
+            shift = float(np.sum(w * delta) / w_sum)
+            center[axis] = _wrap_to_box(center[axis] + shift, length)
+
+    return center
+
+
+def recenter_positions(positions, box_lengths, center):
+    """Shift positions so `center` maps to the origin, then rewrap into the box."""
+    out = np.array(positions, dtype=float, copy=True)
+    for axis in range(3):
+        out[:, axis] = _wrap_to_box(out[:, axis] - float(center[axis]), box_lengths[axis])
+    return out
+
+
+def _frame_positions_recentered(frame, box_lengths, recenter, recenter_species):
+    """Return wrapped positions, typeids, per-particle volumes and the used center."""
+    positions = np.asarray(frame.particles.position, dtype=float)
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    diameters = particle_diameters(frame)
+    volumes = (np.pi / 6.0) * np.asarray(diameters, dtype=float) ** 3
+
+    center = np.zeros(3, dtype=float)
+    if recenter and recenter_species:
+        ref_mask = np.isin(typeids, np.asarray(list(recenter_species), dtype=int))
+        if np.any(ref_mask):
+            center = periodic_center_of_mass(
+                positions[ref_mask],
+                box_lengths,
+                weights=volumes[ref_mask],
+            )
+
+    positions = recenter_positions(positions, box_lengths, center)
+    return positions, typeids, volumes, center
+
+
+def _resolve_centers(positions, typeids, volumes, box_lengths, center_map, recenter):
+    """
+    Centers of mass for every requested key.
+
+    `center_map` is {key: [typeids to average over]}.  Returning a dict rather
+    than a single center is what allows each species to be measured in its own
+    recentered frame, which matters when two condensates drift independently:
+    a frame centered on species A still smears species B.
+    """
+    centers = {}
+    for key, species in (center_map or {}).items():
+        center = np.zeros(3, dtype=float)
+        if recenter and species:
+            mask = np.isin(typeids, np.asarray(list(species), dtype=int))
+            if np.any(mask):
+                center = periodic_center_of_mass(
+                    positions[mask], box_lengths, weights=volumes[mask]
+                )
+        centers[key] = center
+    return centers
+
+
+def density3d_frame_range(n_frames, top_percentage, last_frames=None):
+    """Frame window shared by every pass, matching analyze_density_profile().
+
+    When `last_frames` is given it overrides `top_percentage` and the window is
+    exactly the final `last_frames` frames (or the whole trajectory if shorter).
+    """
+    if last_frames is not None:
+        n_last = max(1, int(last_frames))
+        return max(0, n_frames - n_last), n_frames
+    start = int(n_frames * (1.0 - float(top_percentage)))
+    start = max(0, min(start, n_frames - 1))
+    return start, n_frames
+
+
+def density3d_core_species(frame, species_ids, prepare_config=None):
+    """
+    Return populated core species for 3D density analysis.
+
+    The GSD is authoritative: active types come from ``particles.typeid`` and
+    core roles come from GSD type names and core--patch bond topology.  The
+    active prepare.py configuration is consulted only as a compatibility
+    fallback when an older GSD does not expose enough information to identify
+    a core.  Patch types are excluded unconditionally.
+    """
+    species_ids = [int(s) for s in species_ids]
+    requested = set(species_ids)
+    gsd_cores = core_typeids_from_gsd(frame)
+    cores = [s for s in gsd_cores if s in requested]
+
+    if cores:
+        return cores
+
+    prepare_cores = active_reference_core_typeids_from_prepare(
+        frame, prepare_config=prepare_config
+    ) or []
+    populated = set(populated_typeids_from_gsd(frame))
+    fallback = [
+        int(s) for s in prepare_cores
+        if int(s) in requested
+        and int(s) in populated
+        and classify_type_name(typeid_to_name(frame, int(s))) != "patch"
+    ]
+    if fallback:
+        print(
+            "3D core identification fell back to prepare.py because the GSD "
+            "type names/topology did not identify a requested core."
+        )
+    return unique_preserve_order(fallback)
+
+
+def accumulate_axis_profiles(
+    traj,
+    species_ids,
+    *,
+    start_frame,
+    end_frame,
+    n_bins,
+    box_lengths,
+    recenter=True,
+    recenter_species=None,
+    center_map=None,
+    restrict=None,
+    desc="Axis profiles",
+    progress=True,
+):
+    """
+    Accumulate volume-fraction profiles along x, y and z for every species.
+
+    `center_map`, when given, is {species_id: [typeids]} and each species is
+    histogrammed in a frame recentered on its own center of mass.  Without it
+    every species shares one frame centered on `recenter_species`.
+
+    `restrict`, when given, is {species_id: {axis: (lo, hi)}}.  The profile of
+    that species along axis a then counts only its particles inside the ranges of
+    the other two axes, and the bin volume uses that restricted cross-section
+    instead of the full box face.  This is what converts a plane average into a
+    local density, and it is per species so that two condensates in different
+    places are each refined against their own transverse extent.
+    """
+    species_ids = [int(s) for s in species_ids]
+    axes = (0, 1, 2)
+
+    edges = {a: np.linspace(-box_lengths[a] / 2.0, box_lengths[a] / 2.0, n_bins + 1) for a in axes}
+    centers = {a: 0.5 * (edges[a][:-1] + edges[a][1:]) for a in axes}
+    widths = {a: float(box_lengths[a]) / n_bins for a in axes}
+    box_volume = float(np.prod(box_lengths))
+
+    def _cross_section(species, axis):
+        if restrict is None or species not in restrict:
+            return float(np.prod([box_lengths[b] for b in axes if b != axis]))
+        ranges = restrict[species]
+        return float(
+            np.prod([
+                max(float(ranges[b][1]) - float(ranges[b][0]), 1e-12)
+                for b in axes if b != axis
+            ])
+        )
+
+    bin_volume = {
+        s: {a: widths[a] * _cross_section(s, a) for a in axes} for s in species_ids
+    }
+
+    vf = {a: {s: np.zeros(n_bins, dtype=float) for s in species_ids} for a in axes}
+    whole_box_vf = {s: 0.0 for s in species_ids}
+    frames_used = 0
+
+    for index in tqdm(range(start_frame, end_frame), desc=desc, leave=False, disable=not progress):
+        frame = traj[index]
+        shared_positions, typeids, volumes, _ = _frame_positions_recentered(
+            frame, box_lengths, recenter, recenter_species
+        )
+
+        raw_positions = np.asarray(frame.particles.position, dtype=float)
+        species_centers = _resolve_centers(
+            raw_positions, typeids, volumes, box_lengths, center_map, recenter
+        )
+
+        for s in species_ids:
+            species_mask = typeids == s
+            if not np.any(species_mask):
+                continue
+
+            if center_map is not None and s in species_centers:
+                positions = recenter_positions(raw_positions, box_lengths, species_centers[s])
+            else:
+                positions = shared_positions
+
+            mean_particle_volume = float(np.mean(volumes[species_mask]))
+            whole_box_vf[s] += float(np.sum(volumes[species_mask]) / box_volume)
+
+            for a in axes:
+                if restrict is None or s not in restrict:
+                    mask = species_mask
+                else:
+                    ranges = restrict[s]
+                    mask = species_mask.copy()
+                    for b in axes:
+                        if b == a:
+                            continue
+                        lo, hi = float(ranges[b][0]), float(ranges[b][1])
+                        mask &= (positions[:, b] >= lo) & (positions[:, b] <= hi)
+                    if not np.any(mask):
+                        continue
+
+                hist, _ = np.histogram(positions[mask, a], bins=edges[a])
+                vf[a][s] += hist * mean_particle_volume / bin_volume[s][a]
+
+        frames_used += 1
+
+    if frames_used == 0:
+        raise RuntimeError("No frames were available for 3D density analysis.")
+
+    for s in species_ids:
+        whole_box_vf[s] /= frames_used
+        for a in axes:
+            vf[a][s] /= frames_used
+
+    return {
+        "centers": centers,
+        "vf": vf,
+        "whole_box_vf": whole_box_vf,
+        "frames_used": frames_used,
+        "bin_volume": bin_volume,
+    }
+
+
+def detect_dense_region_1d(
+    centers,
+    signal,
+    *,
+    transition_buffer,
+    smooth_window,
+    min_contrast=1.5,
+    max_width_fraction=0.9,
+    min_dilute_bins=3,
+):
+    """
+    Run the existing Binseg detection on one profile and quality-check it.
+
+    Reuses calculate_low_high_avg_v2 verbatim so the slab and 3D paths cannot
+    drift apart.  Adds the guards that Binseg itself cannot provide: a
+    homogeneous profile still yields four breakpoints and a nominally "dense"
+    segment, so contrast and width are checked before the axis is trusted.
+    """
+    centers = np.asarray(centers, dtype=float)
+    signal = np.asarray(signal, dtype=float)
+
+    result = {
+        "detected": False,
+        "reason": "",
+        "low_vf": np.nan,
+        "high_vf": np.nan,
+        "in_min": np.nan,
+        "in_max": np.nan,
+        "box_left": float(centers[0]) if centers.size else np.nan,
+        "box_right": float(centers[-1]) if centers.size else np.nan,
+        "buffer_min": np.nan,
+        "buffer_max": np.nan,
+        "contrast": np.nan,
+        "width_fraction": np.nan,
+        "dilute_bins": 0,
+        "transition_buffer_used": float(transition_buffer),
+    }
+
+    if centers.size == 0 or not np.any(np.isfinite(signal)) or float(np.nanmax(signal)) <= 0.0:
+        result["reason"] = "empty_or_zero_profile"
+        return result
+
+    df = pd.DataFrame({"position": centers, "signal": signal})
+
+    (
+        low_mean,
+        high_mean,
+        in_min,
+        in_max,
+        box_left,
+        box_right,
+        buffer_min,
+        buffer_max,
+    ) = calculate_low_high_avg_v2(
+        df,
+        transition_buffer=transition_buffer,
+        smooth_window=smooth_window,
+    )
+
+    if in_min is None or in_max is None:
+        result["reason"] = "changepoint_detection_failed"
+        return result
+
+    span = float(box_right) - float(box_left)
+    width_fraction = (float(in_max) - float(in_min)) / span if span > 0 else np.nan
+
+    if low_mean is None or not np.isfinite(low_mean) or low_mean <= 0:
+        contrast = np.inf if (high_mean is not None and np.isfinite(high_mean) and high_mean > 0) else np.nan
+    else:
+        contrast = float(high_mean) / float(low_mean)
+
+    dilute_bins = int(
+        np.sum(
+            ((centers >= box_left) & (centers < buffer_min))
+            | ((centers > buffer_max) & (centers <= box_right))
+        )
+    )
+
+    result.update({
+        "low_vf": float(low_mean) if low_mean is not None else np.nan,
+        "high_vf": float(high_mean) if high_mean is not None else np.nan,
+        "in_min": float(in_min),
+        "in_max": float(in_max),
+        "box_left": float(box_left),
+        "box_right": float(box_right),
+        "buffer_min": float(buffer_min),
+        "buffer_max": float(buffer_max),
+        "contrast": float(contrast) if np.isfinite(contrast) else np.inf,
+        "width_fraction": float(width_fraction),
+        "dilute_bins": dilute_bins,
+    })
+
+    reasons = []
+    if not np.isfinite(result["high_vf"]) or result["high_vf"] <= 0:
+        reasons.append("no_finite_dense_mean")
+    if np.isfinite(contrast) and contrast < float(min_contrast):
+        reasons.append(f"contrast {contrast:.2f} < {float(min_contrast):.2f}")
+    if np.isfinite(width_fraction) and width_fraction > float(max_width_fraction):
+        reasons.append(f"dense width {width_fraction:.2f} of box > {float(max_width_fraction):.2f}")
+    if dilute_bins < int(min_dilute_bins):
+        reasons.append(f"only {dilute_bins} dilute bins outside the buffer")
+
+    result["detected"] = not reasons
+    result["reason"] = "ok" if not reasons else "; ".join(reasons)
+    return result
+
+
+def define_condensate_box(axis_results, box_lengths):
+    """
+    Intersect the per-axis dense ranges into an axis-aligned cuboid.
+
+    Axes that failed detection contribute their full box extent, so a partially
+    detected condensate still produces a usable (if generous) region.
+    """
+    bounds = {}
+    for axis in (0, 1, 2):
+        res = axis_results[axis]
+        if res["detected"]:
+            bounds[axis] = (float(res["in_min"]), float(res["in_max"]))
+        else:
+            bounds[axis] = (-float(box_lengths[axis]) / 2.0, float(box_lengths[axis]) / 2.0)
+
+    volume = float(np.prod([bounds[a][1] - bounds[a][0] for a in (0, 1, 2)]))
+    detected_axes = [DENSITY3D_AXIS_NAMES[a] for a in (0, 1, 2) if axis_results[a]["detected"]]
+    return bounds, volume, detected_axes
+
+
+def extend_bounds_to_threshold(centers, profile, bounds_axis, threshold):
+    """
+    Grow one axis' dense range outward to where the profile drops below the
+    threshold.
+
+    Binseg is asked for a fixed four breakpoints, so its two transition
+    segments eat into the shoulders of a real plateau and the dense segment
+    comes out narrower than the condensate.  That is harmless -- arguably
+    ideal -- for the dense *density*, since it samples the interior and excludes
+    the interface.  It is wrong for the condensate *geometry*: the cuboid ends
+    up inscribed in the droplet rather than matching it.
+
+    This walks outward from the detected segment while the profile stays at or
+    above the threshold.  On a flat-topped profile the density barely moves and
+    the geometry becomes correct.  On a diffuse interface it will pull interface
+    material into the dense average and bias it low, which is why it is opt-in.
+    """
+    centers = np.asarray(centers, dtype=float)
+    profile = np.asarray(profile, dtype=float)
+
+    if centers.size == 0 or not np.isfinite(threshold):
+        return tuple(bounds_axis), False
+
+    lo_index = int(np.argmin(np.abs(centers - float(bounds_axis[0]))))
+    hi_index = int(np.argmin(np.abs(centers - float(bounds_axis[1]))))
+
+    new_lo = lo_index
+    while new_lo - 1 >= 0 and np.isfinite(profile[new_lo - 1]) and profile[new_lo - 1] >= threshold:
+        new_lo -= 1
+
+    new_hi = hi_index
+    while new_hi + 1 < centers.size and np.isfinite(profile[new_hi + 1]) and profile[new_hi + 1] >= threshold:
+        new_hi += 1
+
+    changed = (new_lo != lo_index) or (new_hi != hi_index)
+    return (float(centers[new_lo]), float(centers[new_hi])), changed
+
+
+def _buffered_bounds(bounds, box_lengths, buffers):
+    """Expand a cuboid by a per-axis buffer, clamped to the box."""
+    out = {}
+    for axis in (0, 1, 2):
+        half = float(box_lengths[axis]) / 2.0
+        lo = max(-half, bounds[axis][0] - float(buffers[axis]))
+        hi = min(half, bounds[axis][1] + float(buffers[axis]))
+        out[axis] = (lo, hi)
+    return out
+
+
+def _region_volume(bounds):
+    return float(np.prod([bounds[a][1] - bounds[a][0] for a in (0, 1, 2)]))
+
+
+def measure_region_densities(
+    traj,
+    species_ids,
+    regions,
+    *,
+    start_frame,
+    end_frame,
+    box_lengths,
+    recenter=True,
+    recenter_species=None,
+    desc="Condensate density",
+    progress=True,
+):
+    """
+    Particle-based dense and dilute volume fractions for several regions at once.
+
+    `regions` is {region_key: {"bounds": {...}, "buffered": {...},
+    "center_species": [typeids] or None}}.  Each region is evaluated in the frame
+    recentered on its own `center_species`, so a region detected in one species'
+    frame is measured in that same frame.  For every region and every species
+    this returns the mean over frames of
+
+        dense  = particle volume inside the cuboid / cuboid volume
+        dilute = particle volume outside the buffered cuboid / remaining volume
+
+    together with the sample standard deviation over frames (``dense_vf_std``,
+    ``dilute_vf_std``, ddof=1, NaN for a single frame) and the per-frame values
+    themselves (``dense_vf_frames``, ``dilute_vf_frames``) aligned with
+    ``frame_indices`` and ``timesteps``.
+
+    Both are exact sums over particles, independent of any grid or smoothing
+    choice.  Note the asymmetry that motivates this design: outside the cuboid
+    the whole cross-section really is dilute, so the dilute number is
+    trustworthy, while the dense number is diluted by whatever vapor shares the
+    cuboid with the condensate.
+    """
+    species_ids = [int(s) for s in species_ids]
+    box_volume = float(np.prod(box_lengths))
+
+    geometry = {}
+    for key, region in regions.items():
+        buffered_volume = _region_volume(region["buffered"])
+        geometry[key] = {
+            "cuboid_volume": _region_volume(region["bounds"]),
+            "buffered_volume": buffered_volume,
+            "outside_volume": box_volume - buffered_volume,
+        }
+
+    stats = {
+        key: {
+            "dense_vf": {s: 0.0 for s in species_ids},
+            "dilute_vf": {s: 0.0 for s in species_ids},
+            "mean_dense_particle_count": {s: 0.0 for s in species_ids},
+            "dense_vf_frames": {s: [] for s in species_ids},
+            "dilute_vf_frames": {s: [] for s in species_ids},
+            "dilute_valid": geometry[key]["outside_volume"] > 1e-9,
+        }
+        for key in regions
+    }
+
+    frames_used = 0
+    frame_indices = []
+    timesteps = []
+
+    center_map = {
+        key: (region.get("center_species") or recenter_species)
+        for key, region in regions.items()
+    }
+
+    for index in tqdm(range(start_frame, end_frame), desc=desc, leave=False, disable=not progress):
+        frame = traj[index]
+        shared_positions, typeids, volumes, _ = _frame_positions_recentered(
+            frame, box_lengths, recenter, recenter_species
+        )
+        raw_positions = np.asarray(frame.particles.position, dtype=float)
+        region_centers = _resolve_centers(
+            raw_positions, typeids, volumes, box_lengths, center_map, recenter
+        )
+
+        for key, region in regions.items():
+            positions = recenter_positions(raw_positions, box_lengths, region_centers[key])
+            inside = np.ones(positions.shape[0], dtype=bool)
+            inside_buffered = np.ones(positions.shape[0], dtype=bool)
+            for axis in (0, 1, 2):
+                bounds = region["bounds"]
+                buffered = region["buffered"]
+                inside &= (positions[:, axis] >= bounds[axis][0]) & (positions[:, axis] <= bounds[axis][1])
+                inside_buffered &= (
+                    (positions[:, axis] >= buffered[axis][0]) & (positions[:, axis] <= buffered[axis][1])
+                )
+            outside = ~inside_buffered
+
+            geo = geometry[key]
+            for s in species_ids:
+                species_mask = typeids == s
+                if not np.any(species_mask):
+                    # Keep the per-frame lists aligned with frame_indices.
+                    stats[key]["dense_vf_frames"][s].append(0.0)
+                    stats[key]["dilute_vf_frames"][s].append(
+                        0.0 if stats[key]["dilute_valid"] else np.nan
+                    )
+                    continue
+
+                dense_value = (
+                    float(np.sum(volumes[species_mask & inside]) / geo["cuboid_volume"])
+                    if geo["cuboid_volume"] > 0 else 0.0
+                )
+                stats[key]["dense_vf"][s] += dense_value
+                stats[key]["dense_vf_frames"][s].append(dense_value)
+                stats[key]["mean_dense_particle_count"][s] += float(
+                    np.count_nonzero(species_mask & inside)
+                )
+
+                if stats[key]["dilute_valid"]:
+                    dilute_value = float(
+                        np.sum(volumes[species_mask & outside]) / geo["outside_volume"]
+                    )
+                    stats[key]["dilute_vf"][s] += dilute_value
+                    stats[key]["dilute_vf_frames"][s].append(dilute_value)
+                else:
+                    stats[key]["dilute_vf_frames"][s].append(np.nan)
+
+        frame_indices.append(int(index))
+        try:
+            timesteps.append(int(frame.configuration.step))
+        except (AttributeError, TypeError):
+            timesteps.append(-1)
+        frames_used += 1
+
+    if frames_used == 0:
+        raise RuntimeError("No frames were available for condensate density measurement.")
+
+    def _frame_std(values):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        return float(np.std(values, ddof=1)) if values.size > 1 else np.nan
+
+    for key in regions:
+        stats[key]["dense_vf_std"] = {}
+        stats[key]["dilute_vf_std"] = {}
+        for s in species_ids:
+            stats[key]["dense_vf"][s] /= frames_used
+            stats[key]["mean_dense_particle_count"][s] /= frames_used
+            if stats[key]["dilute_valid"]:
+                stats[key]["dilute_vf"][s] /= frames_used
+            else:
+                stats[key]["dilute_vf"][s] = np.nan
+            stats[key]["dense_vf_std"][s] = _frame_std(stats[key]["dense_vf_frames"][s])
+            stats[key]["dilute_vf_std"][s] = _frame_std(stats[key]["dilute_vf_frames"][s])
+        stats[key].update(geometry[key])
+        stats[key]["box_volume"] = box_volume
+        stats[key]["frames_used"] = frames_used
+        stats[key]["frame_indices"] = list(frame_indices)
+        stats[key]["timesteps"] = list(timesteps)
+
+    return stats
+
+
+def _density3d_buffers(box_lengths, transition_buffer, buffer_box_fraction):
+    """Per-axis transition buffer, capped at a fraction of each box length."""
+    return [
+        min(float(transition_buffer), float(buffer_box_fraction) * float(box_lengths[axis]))
+        for axis in (0, 1, 2)
+    ]
+
+
+def _frame_mean_std(values):
+    """Mean and sample std (ddof=1) of the finite entries; std is NaN below 2 values."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan, np.nan
+    std = float(np.std(values, ddof=1)) if values.size > 1 else np.nan
+    return float(np.mean(values)), std
+
+
+def density3d_grid_shape(box_lengths, voxel_nm=0.5, grid=None, min_bins=8, max_bins=192):
+    """Grid shape from a target voxel edge length, or an explicit cubic grid."""
+    if grid is not None:
+        n = int(grid)
+        return (max(min_bins, n), max(min_bins, n), max(min_bins, n))
+
+    shape = []
+    for axis in range(3):
+        n = int(round(float(box_lengths[axis]) / float(voxel_nm)))
+        shape.append(int(np.clip(n, min_bins, max_bins)))
+    return tuple(shape)
+
+
+def gaussian_concentration_field(
+    traj,
+    species_ids,
+    *,
+    frame_indices,
+    box_lengths,
+    grid_shape,
+    sigma_nm=1.0,
+    recenter=True,
+    recenter_species=None,
+    progress=True,
+):
+    """
+    Build a 3D local volume-fraction field per species from raw particle
+    positions.
+
+    Each particle deposits its hard-sphere volume pi/6 d^3 into a voxel, the
+    grid is convolved with an isotropic Gaussian using mode="wrap" for exact
+    periodicity, then divided by the voxel volume.  gaussian_filter conserves
+    the sum, so the result is a smoothed local volume fraction in the same
+    units as the 1D profiles -- which is precisely what makes a threshold taken
+    from the projections directly applicable here.
+
+    Nothing in this function touches the 1D profiles; it reads the trajectory.
+    """
+    species_ids = [int(s) for s in species_ids]
+    frame_indices = list(frame_indices)
+
+    edges = [
+        np.linspace(-box_lengths[a] / 2.0, box_lengths[a] / 2.0, grid_shape[a] + 1)
+        for a in range(3)
+    ]
+    centers = [0.5 * (edges[a][:-1] + edges[a][1:]) for a in range(3)]
+    voxel_edges = [float(box_lengths[a]) / grid_shape[a] for a in range(3)]
+    voxel_volume = float(np.prod(voxel_edges))
+
+    accum = {s: np.zeros(grid_shape, dtype=float) for s in species_ids}
+    frames_used = 0
+
+    for index in tqdm(frame_indices, desc="Concentration field", leave=False, disable=not progress):
+        frame = traj[index]
+        positions, typeids, volumes, _ = _frame_positions_recentered(
+            frame, box_lengths, recenter, recenter_species
+        )
+
+        for s in species_ids:
+            mask = typeids == s
+            if not np.any(mask):
+                continue
+            hist, _ = np.histogramdd(positions[mask], bins=edges, weights=volumes[mask])
+            accum[s] += hist
+
+        frames_used += 1
+
+    if frames_used == 0:
+        raise RuntimeError("No frames were available for the 3D concentration field.")
+
+    sigma_voxels = [float(sigma_nm) / voxel_edges[a] for a in range(3)]
+
+    fields = {}
+    total = np.zeros(grid_shape, dtype=float)
+    for s in species_ids:
+        smoothed = gaussian_filter(accum[s] / frames_used, sigma=sigma_voxels, mode="wrap")
+        smoothed /= voxel_volume
+        total += smoothed
+        fields[s] = smoothed
+
+    return {
+        "total": total,
+        "per_species": fields,
+        "centers": centers,
+        "edges": edges,
+        "voxel_edges": voxel_edges,
+        "voxel_volume": voxel_volume,
+        "sigma_nm": float(sigma_nm),
+        "sigma_voxels": sigma_voxels,
+        "grid_shape": tuple(int(n) for n in grid_shape),
+        "frames_used": frames_used,
+        "frame_indices": frame_indices,
+    }
+
+
+def condensate_threshold_from_profiles(low_vf, high_vf, fraction=0.5):
+    """Linear interpolation between the projected dilute and dense levels."""
+    if low_vf is None or high_vf is None:
+        return np.nan
+    if not np.isfinite(low_vf) or not np.isfinite(high_vf):
+        return np.nan
+    return float(low_vf) + float(fraction) * (float(high_vf) - float(low_vf))
+
+
+def otsu_threshold(values, n_bins=256):
+    """
+    Otsu's threshold, used only as an independent cross-check on the
+    profile-derived threshold.  Large disagreement between the two means the
+    interface is diffuse and the threshold-dependent numbers deserve suspicion.
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan
+
+    vmin, vmax = float(values.min()), float(values.max())
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return np.nan
+
+    counts, edges = np.histogram(values, bins=int(n_bins), range=(vmin, vmax))
+    counts = counts.astype(float)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    total = counts.sum()
+    if total <= 0:
+        return np.nan
+
+    weight_bg = np.cumsum(counts)
+    weight_fg = total - weight_bg
+    valid = (weight_bg > 0) & (weight_fg > 0)
+    if not np.any(valid):
+        return np.nan
+
+    cumulative_mean = np.cumsum(counts * centers)
+    mean_bg = np.where(weight_bg > 0, cumulative_mean / np.maximum(weight_bg, 1e-12), 0.0)
+    grand_total = cumulative_mean[-1]
+    mean_fg = np.where(weight_fg > 0, (grand_total - cumulative_mean) / np.maximum(weight_fg, 1e-12), 0.0)
+
+    between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+    between[~valid] = -np.inf
+    return float(centers[int(np.argmax(between))])
+
+
+def _periodic_merge_labels(lab, n_labels):
+    """
+    Merge labels that touch across opposite faces of a periodic grid.
+
+    ndimage.label() treats the array edges as walls, so a droplet sitting on the
+    box boundary is split into several pieces.  This joins the pieces that are
+    neighbours through the periodic images, with a small union-find.
+    """
+    parent = list(range(n_labels + 1))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for axis in range(3):
+        first = np.take(lab, 0, axis=axis)
+        last = np.take(lab, lab.shape[axis] - 1, axis=axis)
+        touching = (first > 0) & (last > 0)
+        for a, b in set(zip(first[touching].ravel().tolist(),
+                            last[touching].ravel().tolist())):
+            union(int(a), int(b))
+
+    roots = np.array([find(i) for i in range(n_labels + 1)], dtype=lab.dtype)
+    roots[0] = 0
+    return roots[lab]
+
+
+def _center_mask(mask):
+    """
+    Roll a periodic mask so its center of mass sits in the middle of the grid.
+
+    Lets the plain (non-periodic) hole filling and the min/max extents work on a
+    droplet that straddles the boundary.  Returns the rolled mask.
+    """
+    out = mask
+    shifts = [0, 0, 0]
+    for axis in range(3):
+        n = out.shape[axis]
+        counts = out.sum(axis=tuple(a for a in range(3) if a != axis)).astype(float)
+        total = counts.sum()
+        if total <= 0:
+            continue
+        theta = 2.0 * np.pi * np.arange(n) / n
+        angle = np.arctan2(float(np.sum(counts * np.sin(theta))),
+                           float(np.sum(counts * np.cos(theta))))
+        com = (angle / (2.0 * np.pi)) * n
+        shifts[axis] = int(round(n // 2 - com))
+        out = np.roll(out, shifts[axis], axis=axis)
+    return out, shifts
+
+
+def droplet_extents_mask(field, axes_coords, threshold, largest_only=True,
+                         periodic=True, fill_holes=True):
+    """
+    field: (nx, ny, nz) array
+    axes_coords: (x, y, z) 1D coordinate arrays matching field's axes, in nm
+    Returns H_z, W_xy, the aspect ratio and the isosurface volume.
+
+    The mask is every voxel at or above `threshold`.  With `largest_only` only
+    the biggest connected blob is kept, so small satellite droplets are ignored;
+    with `periodic` the blobs are joined across the box faces first, so a
+    droplet on the boundary is not cut into pieces.  With `fill_holes` voxels
+    fully enclosed by the droplet count as part of it, which is what you want
+    for a volume but which also hides real internal voids -- `volume_filled_nm3`
+    and `volume_raw_nm3` are both returned so you can see how much was filled.
+
+    Volumes are voxel counts times the voxel volume, so their resolution is the
+    voxel size and their accuracy is set by the threshold and by the Gaussian
+    width used to build the field.
+    """
+    from scipy import ndimage
+
+    x, y, z = (np.asarray(a, dtype=float) for a in axes_coords)
+    mask = np.asarray(field, dtype=float) >= float(threshold)
+
+    dx = float(np.mean(np.diff(x)))
+    dy = float(np.mean(np.diff(y)))
+    dz = float(np.mean(np.diff(z)))
+    voxel_volume = dx * dy * dz
+
+    empty = dict(H_z=np.nan, W_x=np.nan, W_y=np.nan, W_xy=np.nan, aspect=np.nan,
+                 volume_nm3=np.nan, volume_filled_nm3=np.nan, volume_raw_nm3=np.nan,
+                 hole_volume_nm3=np.nan, n_blobs=0, largest_blob_fraction=np.nan,
+                 radius_equiv_nm=np.nan, voxel_volume_nm3=voxel_volume, mask=None,
+                 mask_raw=None)
+    if not mask.any():
+        return empty
+
+    n_blobs = 1
+    largest_fraction = 1.0
+    if largest_only:
+        structure = ndimage.generate_binary_structure(3, 1)   # 6-connectivity
+        lab, n = ndimage.label(mask, structure=structure)
+        if periodic and n > 1:
+            lab = _periodic_merge_labels(lab, n)
+        present = np.unique(lab[lab > 0])
+        n_blobs = int(present.size)
+        if n_blobs > 1:
+            sizes = np.array([int(np.count_nonzero(lab == k)) for k in present], dtype=float)
+            largest_fraction = float(sizes.max() / sizes.sum())
+            mask = lab == present[int(np.argmax(sizes))]
+
+    # Put the blob in the middle of the grid: plain hole filling and the min/max
+    # extents below both assume it does not wrap around the edges.
+    shifts = [0, 0, 0]
+    if periodic:
+        mask, shifts = _center_mask(mask)
+
+    raw_voxels = int(np.count_nonzero(mask))
+    filled = ndimage.binary_fill_holes(mask) if fill_holes else mask
+    filled_voxels = int(np.count_nonzero(filled))
+
+    mask_on_grid = filled
+    raw_on_grid = mask
+    for axis, shift in enumerate(shifts):
+        if shift:
+            mask_on_grid = np.roll(mask_on_grid, -shift, axis=axis)
+            raw_on_grid = np.roll(raw_on_grid, -shift, axis=axis)
+
+    ix, iy, iz = np.nonzero(filled)
+
+    # +1 voxel so a single-voxel-thick object has thickness dz, not 0
+    H_z  = (iz.max() - iz.min()) * dz + dz
+    W_x  = (ix.max() - ix.min()) * dx + dx
+    W_y  = (iy.max() - iy.min()) * dy + dy
+    W_xy = 0.5 * (W_x + W_y)          # or max(W_x, W_y)
+
+    volume_filled = filled_voxels * voxel_volume
+    volume_raw = raw_voxels * voxel_volume
+
+    return dict(H_z=H_z, W_x=W_x, W_y=W_y, W_xy=W_xy, aspect=H_z / W_xy,
+                volume_nm3=volume_filled,
+                volume_filled_nm3=volume_filled,
+                volume_raw_nm3=volume_raw,
+                hole_volume_nm3=volume_filled - volume_raw,
+                n_blobs=n_blobs,
+                largest_blob_fraction=largest_fraction,
+                radius_equiv_nm=float((3.0 * volume_filled / (4.0 * np.pi)) ** (1.0 / 3.0)),
+                voxel_volume_nm3=voxel_volume,
+                mask=mask_on_grid, mask_raw=raw_on_grid)
+
+
+def voxel_lookup(positions, mask, centers):
+    """Boolean per position: is the voxel containing its centre inside the mask?
+
+    Same voxel assignment as count_particles_in_mask, so counts agree.
+    """
+    idx = []
+    for axis in range(3):
+        c = np.asarray(centers[axis], dtype=float)
+        step = float(np.mean(np.diff(c)))
+        start = c[0] - 0.5 * step
+        idx.append(np.mod(np.floor((np.asarray(positions)[:, axis] - start) / step).astype(int),
+                          mask.shape[axis]))
+    return np.asarray(mask)[idx[0], idx[1], idx[2]]
+
+
+def count_particles_in_mask(positions, typeids, species_ids, mask, centers):
+    """
+    How many particles of each species sit inside a voxel mask.
+
+    positions must be in the same (recentered) coordinates as the field the
+    mask came from.  A particle is counted when the voxel containing its
+    center is inside the mask, which is the direct analogue of the cuboid
+    count: whole particles, no partial credit at the surface.
+    """
+    if mask is None:
+        return {int(s): np.nan for s in species_ids}
+
+    edges = []
+    for axis, c in enumerate(centers):
+        c = np.asarray(c, dtype=float)
+        step = float(np.mean(np.diff(c)))
+        edges.append((c[0] - 0.5 * step, step, mask.shape[axis]))
+
+    idx = []
+    for axis in range(3):
+        start, step, n = edges[axis]
+        # wrap, so a particle just outside the grid lands in the periodic image
+        idx.append(np.mod(np.floor((positions[:, axis] - start) / step).astype(int), n))
+
+    inside = mask[idx[0], idx[1], idx[2]]
+    return {int(s): int(np.count_nonzero(inside & (typeids == int(s))))
+            for s in species_ids}
+
+
+def measure_blob_densities(
+    positions, typeids, volumes, species_ids, mask, centers, voxel_volume,
+    erode_voxels=0, buffer_voxels=2,
+):
+    """
+    Dense and dilute volume fractions using the isosurface blob as the region.
+
+        dense  = particle volume inside the blob / blob volume
+        dilute = particle volume outside the blob dilated by buffer_voxels,
+                 divided by the volume left over
+
+    Keeps the particle-based convention of high_vf/low_vf: whole particles,
+    assigned by the voxel their center sits in.  erode_voxels > 0 shrinks the
+    blob first, dropping the interface shell so the result is the plateau
+    density rather than the blob average.
+    """
+    from scipy import ndimage
+
+    out = {int(s): {"dense_vf": np.nan, "dilute_vf": np.nan,
+                    "dense_volume_nm3": np.nan, "dilute_volume_nm3": np.nan,
+                    "blob_erode_voxels": erode_voxels,
+                    "blob_buffer_voxels": buffer_voxels,}
+           for s in species_ids}
+    if mask is None or not mask.any():
+        return out
+
+    ball = ndimage.generate_binary_structure(3, 1)
+    dense_mask = mask
+    if erode_voxels:
+        dense_mask = ndimage.binary_erosion(mask, ball, iterations=int(erode_voxels))
+        if not dense_mask.any():
+            dense_mask = mask
+    outside_mask = ~ndimage.binary_dilation(mask, ball, iterations=int(buffer_voxels))
+
+    dense_volume = int(np.count_nonzero(dense_mask)) * voxel_volume
+    dilute_volume = int(np.count_nonzero(outside_mask)) * voxel_volume
+
+    idx = []
+    for axis in range(3):
+        c = np.asarray(centers[axis], dtype=float)
+        step = float(np.mean(np.diff(c)))
+        start = c[0] - 0.5 * step
+        idx.append(np.mod(np.floor((positions[:, axis] - start) / step).astype(int),
+                          mask.shape[axis]))
+
+    in_dense = dense_mask[idx[0], idx[1], idx[2]]
+    in_dilute = outside_mask[idx[0], idx[1], idx[2]]
+
+    for s in species_ids:
+        s = int(s)
+        species_mask = typeids == s
+        out[s] = {
+            "dense_vf": (float(np.sum(volumes[species_mask & in_dense]) / dense_volume)
+                         if dense_volume > 0 else np.nan),
+            "dilute_vf": (float(np.sum(volumes[species_mask & in_dilute]) / dilute_volume)
+                          if dilute_volume > 0 else np.nan),
+            "dense_volume_nm3": dense_volume,
+            "dilute_volume_nm3": dilute_volume,
+            "blob_erode_voxels": erode_voxels,
+            "blob_buffer_voxels": buffer_voxels,
+        }
+    return out
+
+
+# ----------------- POLYMER CONTACTS AND LOCATION ANALYSIS --------------------
+
+DEFAULT_POLYMER_BEAD_NAMES = ("FixedPolyBead", "FixedPolyBead_1", "FixedPolyBead_2", "FixedPolyBead_core", "FixedPolyBead_PatchA",
+                              "FixedPolyBead_1_core", "FixedPolyBead_1_PatchA", "FixedPolyBead_2_core", "FixedPolyBead_2_PatchA")
+
+
+def polymer_typeids(
+    frame,
+    polymer_bead_names=DEFAULT_POLYMER_BEAD_NAMES,
+    patch_name_markers=("patch",),
+):
+    """Type ids of the fixed polymer in this frame, split into cores and patches.
+
+    Works off the type-name list, so the polymer is recognized even in frames
+    where it has no particles yet.  Patch types never take part in the center
+    of mass or in the contact test: a patch-patch contact is counted once, as a
+    contact between the polymer core bead and the reference core.
+    """
+    type_names = get_type_names(frame)
+    name_to_id = {name: i for i, name in enumerate(type_names)}
+
+    def _is_patch(name):
+        return any(m.lower() in name.lower() for m in patch_name_markers)
+
+    found = [name_to_id[n] for n in polymer_bead_names if n in name_to_id]
+    cores = [t for t in found if not _is_patch(type_names[t])]
+    patches = [t for t in found if _is_patch(type_names[t])]
+    return cores, patches
+
+
+POLYMER_CHAIN_COLUMNS = (
+    "x_nm", "y_nm", "x_lab_nm", "y_lab_nm",
+    "n_contacts", "contact_fraction", "min_distance_nm",
+    "n_core_beads_in", "n_core_beads_total",
+)
+
+
+def split_polymer_chains(frame, core_typeids, patch_typeids=()):
+    """
+    The fixed polymers in a frame, one entry per chain.
+
+    Chains are the connected components of the bond network restricted to the
+    polymer particles (cores and patches), so each chain is found correctly
+    whatever bead types it is made of: two chains of different types, two
+    chains of the SAME type, or one chain mixing types (e.g. FixedPolyBead
+    and FixedPolyBead_2 in one sequence) all come out right.  Without bonds in
+    the frame it falls back to one chain per core type.
+
+    Returned in order of their lowest particle tag, which never changes in a
+    trajectory, so polymer1, polymer2, ... always mean the same chains.  Each
+    entry is {"label", "core_tags", "patch_tags"}; the label is the chain's
+    core type name(s), e.g. "FixedPolyBead_2".
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    typeids = np.asarray(frame.particles.typeid, dtype=int)
+    type_names = get_type_names(frame)
+    core_typeids = [int(t) for t in core_typeids]
+    patch_typeids = [int(t) for t in patch_typeids]
+    is_core = np.isin(typeids, core_typeids)
+    is_poly = is_core | np.isin(typeids, patch_typeids)
+    poly_tags = np.nonzero(is_poly)[0]
+    if poly_tags.size == 0:
+        return []
+
+    try:
+        groups = np.asarray(frame.bonds.group, dtype=int).reshape(-1, 2)
+    except (AttributeError, TypeError, ValueError):
+        groups = np.zeros((0, 2), dtype=int)
+
+    chains = []
+    if groups.size:
+        both = is_poly[groups[:, 0]] & is_poly[groups[:, 1]]
+        groups = groups[both]
+    if groups.size:
+        local = -np.ones(len(typeids), dtype=int)
+        local[poly_tags] = np.arange(poly_tags.size)
+        a, b = local[groups[:, 0]], local[groups[:, 1]]
+        graph = coo_matrix((np.ones(a.size), (a, b)), shape=(poly_tags.size,) * 2)
+        _, labels = connected_components(graph, directed=False)
+        for comp in np.unique(labels):
+            tags = poly_tags[labels == comp]
+            core = tags[is_core[tags]]
+            if core.size == 0:
+                continue                     # a stray patch group without a core
+            chains.append({"core_tags": core, "patch_tags": tags[~is_core[tags]]})
+    else:
+        for t in core_typeids:
+            core = np.nonzero(typeids == t)[0]
+            if core.size:
+                chains.append({"core_tags": core, "patch_tags": np.array([], dtype=int)})
+
+    chains.sort(key=lambda c: int(c["core_tags"].min()))
+    for chain in chains:
+        names = sorted({type_names[int(t)] for t in typeids[chain["core_tags"]]})
+        chain["label"] = "+".join(n[:-5] if n.endswith("_core") else n for n in names)
+    return chains
+
+
+def fixed_polymer_contacts(
+    frame,
+    *,
+    reference_species,
+    isosurface_counts,
+    bead_typeids,
+    patch_typeids=(),
+    box_lengths=None,
+    bounds=None,            # cuboid axis results; only beads inside take part in contacts
+    bounds_contrast=None,   # set contrast to see whether to take the entire polymer or not
+    recenter=True,
+    recenter_species=None,
+    contact_scale=1.0,
+    contact_tolerance_nm=0.01,
+    bead_tags=None,
+):
+    """
+    Position of the fixed polymer and its contacts with the reference species,
+    for ONE frame.
+
+    bead_tags restricts the analysis to those particle tags, i.e. one chain
+    from split_polymer_chains(); without it every bead of bead_typeids is
+    treated as one polymer.
+
+    The polymer runs along z, so its position is a point in the xy plane: the
+    volume-weighted periodic center of mass of its core beads.  It is returned
+    twice: in lab coordinates (x_lab_nm, y_lab_nm), where a fixed chain does
+    not move, and in the recentered coordinates this frame's density analysis
+    and concentration field use (x_nm, y_nm), which is where it has to be drawn
+    on the field figures.  The shift is taken from _frame_positions_recentered,
+    the same call the profiles and the field use, so the two cannot disagree.
+
+    A reference particle counts as being in contact when its center is within
+
+        contact_scale * (d_reference + d_bead) / 2 + contact_tolerance_nm
+
+    of any polymer core bead, minimum image.  Each reference particle is
+    counted once however many beads it touches, and patch beads are ignored.
+    The contact_scale is 2^(1/6) if the polymer uses LJ attraction.
+
+    Returns a dict; polymer_present is False when the frame has no polymer
+    beads or no reference particles, with the numeric entries set to NaN.
+    """
+    if box_lengths is None:
+        box_lengths = np.asarray(frame.configuration.box[:3], dtype=float)
+    box_lengths = np.asarray(box_lengths, dtype=float)
+    bead_typeids = [int(t) for t in bead_typeids]
+    patch_typeids = [int(t) for t in patch_typeids]
+
+    result = {
+        "polymer_present": False,
+        "x_nm": np.nan, "y_nm": np.nan,
+        "x_lab_nm": np.nan, "y_lab_nm": np.nan,
+        "n_contacts": np.nan,
+        "n_reference_particles": np.nan,
+        "contact_fraction": np.nan,
+        "min_distance_nm": np.nan,
+        "n_core_beads": 0,
+        "n_patch_beads": 0,
+        "contact_indices": np.array([], dtype=int),
+        "contact_cutoff_max_nm": np.nan,
+    }
+
+    # Same shift as the profiles, the measured regions and the field.
+    positions, typeids, volumes, shift = _frame_positions_recentered(
+        frame, box_lengths, recenter, recenter_species
+    )
+    diameters = particle_diameters(frame)
+
+    bead_mask = np.isin(typeids, bead_typeids)
+    if bead_tags is not None:
+        chain_mask = np.zeros(len(typeids), dtype=bool)
+        chain_mask[np.asarray(bead_tags, dtype=int)] = True
+        bead_mask &= chain_mask
+    all_bead_mask = bead_mask.copy()
+    if bounds is not None:
+        # Only the stretch of chain inside the condensate cuboid can be in
+        # contact with the dense phase; beads above and below it would add
+        # contacts from wherever else the chain passes through particles.
+        in_bounds = np.ones(len(positions), dtype=bool)
+        for axis in range(3):
+            # TODO: for now we consider only the z-axis for the polymer contacts, as it eases the estimation. Need to change to adapt per polymer direction.
+            if axis != 2:
+                continue
+            lo, hi = float(bounds[axis]["in_min"]), float(bounds[axis]["in_max"])
+            if bounds_contrast is not None:
+                if bounds[axis]["contrast"] < bounds_contrast:
+                    continue
+            in_bounds &= (positions[:, axis] >= lo) & (positions[:, axis] <= hi)
+        bead_mask &= in_bounds
+
+    ref_mask = typeids == int(reference_species)
+    result["n_core_beads"] = int(np.count_nonzero(bead_mask))
+    result["n_core_beads_total"] = int(np.count_nonzero(all_bead_mask))
+    result["n_patch_beads"] = int(np.count_nonzero(np.isin(typeids, patch_typeids)))
+    n_ref = int(np.count_nonzero(ref_mask))
+    result["n_reference_particles"] = n_ref
+
+    if result["n_core_beads_total"] == 0 or n_ref == 0:
+        return result
+
+    bead_pos = positions[bead_mask]
+    bead_d = diameters[bead_mask]
+    bead_weights = volumes[all_bead_mask]  # Initially: volumes[bead_mask]
+    ref_pos = positions[ref_mask]
+    ref_d = diameters[ref_mask]
+    ref_index = np.nonzero(ref_mask)[0]
+
+    center = periodic_center_of_mass(positions[all_bead_mask], box_lengths, weights=bead_weights)
+    raw_bead_pos = np.asarray(frame.particles.position, dtype=float)[all_bead_mask]
+    lab_center = periodic_center_of_mass(raw_bead_pos, box_lengths, weights=bead_weights)
+
+    touching = np.zeros(n_ref, dtype=bool)
+    min_distance = np.inf
+    cutoff_max = -np.inf
+    for bpos, bd in zip(bead_pos, bead_d):
+        delta = ref_pos - bpos
+        for axis in range(3):
+            delta[:, axis] = _wrap_to_box(delta[:, axis], box_lengths[axis])
+        distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        lorentz_sum = 0.5 * (ref_d + bd)
+        cutoff = contact_scale * lorentz_sum + contact_tolerance_nm
+        cutoff_max = max(cutoff_max, float(np.max(cutoff)))
+        touching |= distance <= cutoff
+        if distance.size:
+            min_distance = min(min_distance, float(np.min(distance)))
+
+    n_contacts = int(np.count_nonzero(touching))
+    ref_vol_count = isosurface_counts[int(reference_species)]
+    result.update({
+        "polymer_present": True,
+        "bead_positions": positions[all_bead_mask],          # recentered, for plotting
+        "bead_positions_lab": raw_bead_pos,
+        "bead_positions_in_bounds": bead_pos,              # the stretch used for contacts
+        "x_nm": float(center[0]), "y_nm": float(center[1]),
+        "x_lab_nm": float(lab_center[0]), "y_lab_nm": float(lab_center[1]),
+        "n_contacts": n_contacts,
+        "contact_fraction": n_contacts / ref_vol_count if ref_vol_count else np.nan,
+        "min_distance_nm": min_distance if np.isfinite(min_distance) else np.nan,
+        "contact_indices": ref_index[touching],
+        "contact_cutoff_max_nm": cutoff_max if np.isfinite(cutoff_max) else np.nan,
+        "center_shift_nm": tuple(float(v) for v in shift),
+    })
+    return result
+
+
+# -----------------------------------------------------------------------------
+# 3D rendering helpers
+# -----------------------------------------------------------------------------
+
+
+def _cuboid_edge_segments(bounds):
+    """The 12 edges of the axis-aligned cuboid, for wireframe overlays."""
+    x0, x1 = bounds[0]
+    y0, y1 = bounds[1]
+    z0, z1 = bounds[2]
+    corners = [
+        (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+        (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+    ]
+    pairs = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    return [(corners[i], corners[j]) for i, j in pairs]
+
+
+def _threshold_point_cloud(field, centers, threshold, max_points=60000, seed=0):
+    """Voxel centers and values above threshold, subsampled if needed."""
+    field = np.asarray(field, dtype=float)
+    mask = np.isfinite(field) & (field >= float(threshold))
+    n_above = int(np.count_nonzero(mask))
+    if n_above == 0:
+        return None
+
+    gx, gy, gz = np.meshgrid(centers[0], centers[1], centers[2], indexing="ij")
+    points = np.column_stack([gx[mask], gy[mask], gz[mask]])
+    values = field[mask]
+
+    if n_above > int(max_points):
+        rng = np.random.default_rng(seed)
+        keep = rng.choice(n_above, size=int(max_points), replace=False)
+        points = points[keep]
+        values = values[keep]
+
+    return {"points": points, "values": values, "n_above": n_above, "threshold": float(threshold)}
+
+
+def _setup_3d_axes(ax, box_lengths):
+    ax.set_xlim(-box_lengths[0] / 2.0, box_lengths[0] / 2.0)
+    ax.set_ylim(-box_lengths[1] / 2.0, box_lengths[1] / 2.0)
+    ax.set_zlim(-box_lengths[2] / 2.0, box_lengths[2] / 2.0)
+    try:
+        ax.set_box_aspect((box_lengths[0], box_lengths[1], box_lengths[2]))
+    except Exception:
+        pass
+    ax.set_xlabel("x [nm]", fontsize=8, labelpad=-4)
+    ax.set_ylabel("y [nm]", fontsize=8, labelpad=-4)
+    ax.set_zlabel("z [nm]", fontsize=8, labelpad=-4)
+    ax.tick_params(labelsize=6, pad=-2)
+    ax.grid(False)
+
+
+def _draw_cloud(
+    ax,
+    cloud,
+    *,
+    vmax,
+    cmap=None,
+    base_color=None,
+    marker_size=5.0,
+    alpha_min=0.05,
+    alpha_power=1.4,
+):
+    """
+    Draw one thresholded point cloud.
+
+    With `cmap` the voxels are colored by concentration; with `base_color` they
+    take a single hue whose lightness and alpha ramp with concentration, which is
+    what keeps two species distinguishable when overlaid.
+    """
+    values = cloud["values"]
+    span = max(float(vmax) - float(cloud["threshold"]), 1e-12)
+    scaled = np.clip((values - float(cloud["threshold"])) / span, 0.0, 1.0)
+
+    if cmap is not None:
+        rgba = cmap(scaled)
+    else:
+        base = np.asarray(base_color, dtype=float).reshape(1, 3)
+        lightness = (0.45 + 0.55 * scaled).reshape(-1, 1)
+        rgba = np.ones((values.size, 4), dtype=float)
+        rgba[:, :3] = np.clip(base * lightness, 0.0, 1.0)
+
+    rgba[:, 3] = alpha_min + (1.0 - alpha_min) * scaled ** float(alpha_power)
+
+    ax.scatter(
+        cloud["points"][:, 0],
+        cloud["points"][:, 1],
+        cloud["points"][:, 2],
+        c=rgba,
+        s=float(marker_size),
+        marker="o",
+        linewidths=0.0,
+        depthshade=False,
+    )
+
+
+def _draw_cuboid(ax, bounds, color="black", lw=0.6, alpha=0.45, ls="--"):
+    for (p0, p1) in _cuboid_edge_segments(bounds):
+        ax.plot(
+            [p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+            color=color, lw=lw, alpha=alpha, linestyle=ls,
+        )
+
+
+def _resolve_display_threshold(field, threshold, centers, max_points):
+    """
+    Fall back to a percentile threshold when the profile threshold is unusable,
+    so a figure is still produced rather than silently skipped.
+    """
+    field = np.asarray(field, dtype=float)
+    note = ""
+    effective = float(threshold) if threshold is not None else np.nan
+
+    if not np.isfinite(effective):
+        effective = float(np.nanpercentile(field, 99.0))
+        note = " (threshold from 99th percentile: profile threshold unavailable)"
+
+    cloud = _threshold_point_cloud(field, centers, effective, max_points=max_points)
+    if cloud is None:
+        effective = float(np.nanpercentile(field, 99.0))
+        note = " (threshold fell back to 99th percentile: no voxels above the profile threshold)"
+        cloud = _threshold_point_cloud(field, centers, effective, max_points=max_points)
+
+    return cloud, effective, note
+
+
+def _save_figure(fig, output_dir, basename, figure_format, extra=None):
+    written = []
+    formats = ["png", "svg"] if figure_format == "both" else [figure_format]
+    for fmt in formats:
+        path = os.path.join(output_dir, f"{basename}.{fmt}")
+        fig.savefig(path, bbox_inches="tight")
+        written.append(path)
+    if extra:
+        written.extend(extra)
+    return written
+
+
+def _draw_entries(ax, entries, *, box_lengths, marker_size, alpha_min, alpha_power):
+    """Draw a list of clouds into one 3D axes; used by the GIF and interactive paths."""
+    for entry in entries:
+        _draw_cloud(
+            ax, entry["cloud"],
+            vmax=entry["vmax"],
+            cmap=entry.get("cmap"),
+            base_color=entry.get("base_color"),
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+        )
+        if entry.get("bounds") is not None:
+            _draw_cuboid(ax, entry["bounds"], color=entry.get("base_color") or "black", alpha=0.6)
+    _setup_3d_axes(ax, box_lengths)
+
+
+def _write_field_rotation_gif(
+    entries,
+    *,
+    box_lengths,
+    marker_size,
+    alpha_min,
+    alpha_power,
+    output_dir,
+    basename,
+    title,
+    n_frames=36,
+    dpi=100,
+):
+    """Turntable GIF, for viewing the field from all azimuths."""
+    try:
+        from matplotlib.animation import FuncAnimation, PillowWriter
+    except Exception as exc:
+        print(f"Rotation GIF skipped: {exc}")
+        return None
+
+    fig = plt.figure(figsize=(6.0, 5.4), dpi=dpi)
+    ax = fig.add_subplot(111, projection="3d")
+    _draw_entries(
+        ax, entries, box_lengths=box_lengths,
+        marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+    )
+    ax.set_title(title, fontsize=9)
+
+    azimuths = np.linspace(0.0, 360.0, int(n_frames), endpoint=False)
+
+    def update(i):
+        ax.view_init(elev=20.0, azim=float(azimuths[i]))
+        return ()
+
+    path = os.path.join(output_dir, f"{basename}_rotation.gif")
+    try:
+        animation = FuncAnimation(fig, update, frames=len(azimuths), blit=False)
+        animation.save(path, writer=PillowWriter(fps=12))
+    except Exception as exc:
+        print(f"Rotation GIF skipped: {exc}")
+        plt.close(fig)
+        return None
+
+    plt.close(fig)
+    return path
+
+
+def _show_field_interactive(
+    entries,
+    *,
+    box_lengths,
+    marker_size,
+    alpha_min,
+    alpha_power,
+    title,
+):
+    """
+    Open a rotatable window, for when you want to drag the view yourself.
+
+    The module forces the Agg backend at import, so this switches backends and
+    degrades quietly on headless machines.
+    """
+    for backend in ("QtAgg", "TkAgg", "MacOSX"):
+        try:
+            matplotlib.use(backend, force=True)
+            break
+        except Exception:
+            continue
+
+    if matplotlib.get_backend().lower().startswith("agg"):
+        print("Interactive 3D view skipped: no GUI backend available.")
+        return
+
+    try:
+        import matplotlib.pyplot as interactive_plt
+
+        fig = interactive_plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+        _draw_entries(
+            ax, entries, box_lengths=box_lengths,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+        )
+        ax.set_title(f"{title} (drag to rotate)")
+        interactive_plt.show()
+    except Exception as exc:
+        print(f"Interactive 3D view failed: {exc}")
+    finally:
+        matplotlib.use("Agg", force=True)
+
+
+def plot_concentration_field_3d(
+    field,
+    centers,
+    *,
+    threshold,
+    bounds,
+    box_lengths,
+    output_dir,
+    basename,
+    title,
+    views=DENSITY3D_DEFAULT_VIEWS,
+    polymer_points=None,
+    polymer_marker_size=6.0,
+    max_points=60000,
+    marker_size=5.0,
+    alpha_min=0.05,
+    alpha_power=1.4,
+    cmap_name="inferno",
+    figure_format="png",
+    dpi=200,
+    rotate_gif=False,
+    gif_frames=36,
+    interactive=False,
+):
+    """
+    Multi-view render of one species' 3D concentration field.
+
+    Voxels below the threshold are simply not drawn, so the dilute phase is
+    transparent; above-threshold voxels are colored and alpha-ramped by
+    concentration so the dense core reads through the surface.  Several
+    viewpoints are drawn in one figure because a single projection of a 3D
+    scalar field is easy to misread.
+
+    Scatter output is written as PNG by default: an SVG of tens of thousands of
+    markers is enormous and slow to open.
+    """
+    cloud, effective_threshold, fallback_note = _resolve_display_threshold(
+        field, threshold, centers, max_points
+    )
+    if cloud is None:
+        print(f"3D field plot skipped for {basename}: the concentration field is empty.")
+        return []
+
+    vmax = float(np.nanmax(field))
+    cmap = plt.get_cmap(cmap_name)
+    views = list(views) if views else list(DENSITY3D_DEFAULT_VIEWS)
+
+    n_cols = 2 if len(views) > 1 else 1
+    n_rows = int(np.ceil(len(views) / n_cols))
+    fig = plt.figure(figsize=(6.0 * n_cols, 5.4 * n_rows), dpi=dpi)
+
+    for i, (elev, azim) in enumerate(views):
+        ax = fig.add_subplot(n_rows, n_cols, i + 1, projection="3d")
+        _draw_cloud(
+            ax, cloud, vmax=vmax, cmap=cmap,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+        )
+        if bounds is not None:
+            _draw_cuboid(ax, bounds)
+        if polymer_points is not None and len(polymer_points):
+            # The fixed polymer's own beads, so their path through the field is
+            # visible rather than just their mean position.
+            ax.scatter(
+                polymer_points[:, 0], polymer_points[:, 1], polymer_points[:, 2],
+                s=polymer_marker_size, c="red", marker="o",
+                depthshade=False, linewidths=0.0, zorder=5,
+            )
+        _setup_3d_axes(ax, box_lengths)
+        ax.view_init(elev=float(elev), azim=float(azim))
+        ax.set_title(f"elev={float(elev):.0f}, azim={float(azim):.0f}", fontsize=9)
+
+    mappable = ScalarMappable(norm=Normalize(vmin=effective_threshold, vmax=vmax), cmap=cmap)
+    mappable.set_array([])
+    cbar = fig.colorbar(mappable, ax=fig.axes, shrink=0.6, pad=0.02, fraction=0.03)
+    cbar.set_label("local volume fraction [dimensionless]", fontsize=9)
+    cbar.ax.tick_params(labelsize=7)
+
+    fig.suptitle(
+        f"{title}\nthreshold = {effective_threshold:.4g}{fallback_note}; "
+        f"{cloud['n_above']} of {np.asarray(field).size} voxels above threshold",
+        fontsize=11,
+    )
+
+    entries = [{"cloud": cloud, "cmap": cmap, "bounds": bounds, "vmax": vmax}]
+    extra = []
+
+    if rotate_gif:
+        gif_path = _write_field_rotation_gif(
+            entries, box_lengths=box_lengths,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+            output_dir=output_dir, basename=basename, title=title,
+            n_frames=int(gif_frames), dpi=max(90, int(dpi // 2)),
+        )
+        if gif_path:
+            extra.append(gif_path)
+
+    if interactive:
+        _show_field_interactive(
+            entries, box_lengths=box_lengths,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+            title=title,
+        )
+
+    written = _save_figure(fig, output_dir, basename, figure_format, extra=extra)
+    plt.close(fig)
+    return written
+
+
+def plot_filled_isosurface_3d(
+    mask,
+    centers,
+    *,
+    box_lengths,
+    output_dir,
+    basename,
+    title,
+    raw_mask=None,
+    polymer_points=None,
+    views=DENSITY3D_DEFAULT_VIEWS,
+    surface_color="darkorange",
+    hole_color="royalblue",
+    alpha=0.45,
+    mesh_step=1,
+    figure_format="png",
+    dpi=200,
+    write_html=False,
+):
+    """
+    Render the filled isosurface mask (the region used for V_in and the
+    isosurface counts) as a closed triangulated surface.
+
+    The mask is padded with one empty voxel on every side before marching
+    cubes, so a blob that touches a grid face is closed off there instead of
+    being drawn as an open shell.  If raw_mask (the mask before hole filling)
+    is given, the voxels that filling added are drawn as blue points.
+    mesh_step > 1 coarsens the mesh for large grids.  write_html also writes
+    a rotatable plotly version if plotly is installed.
+    """
+    if mask is None or not np.any(mask):
+        print(f"Isosurface plot skipped for {basename}: no condensate mask in this frame.")
+        return []
+
+    mask = np.asarray(mask, dtype=bool)
+    centers = [np.asarray(c, dtype=float) for c in centers]
+    steps = [float(np.mean(np.diff(c))) for c in centers]
+
+    hole_xyz = None
+    if raw_mask is not None:
+        holes = mask & ~np.asarray(raw_mask, dtype=bool)
+        if holes.any():
+            ix, iy, iz = np.nonzero(holes)
+            hole_xyz = np.column_stack([centers[0][ix], centers[1][iy], centers[2][iz]])
+
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    origin = np.array([c[0] - h for c, h in zip(centers, steps)])
+
+    verts = faces = None
+    try:
+        from skimage.measure import marching_cubes
+        verts, faces, _, _ = marching_cubes(
+            padded.astype(np.float32), level=0.5, spacing=tuple(steps),
+            step_size=max(1, int(mesh_step)),
+        )
+        verts = verts + origin
+    except ImportError:
+        print("scikit-image not installed: drawing the isosurface as boundary voxels instead.")
+
+    views = list(views) if views else list(DENSITY3D_DEFAULT_VIEWS)
+    n_cols = 2 if len(views) > 1 else 1
+    n_rows = int(np.ceil(len(views) / n_cols))
+    fig = plt.figure(figsize=(6.0 * n_cols, 5.4 * n_rows), dpi=dpi)
+
+    for i, (elev, azim) in enumerate(views):
+        ax = fig.add_subplot(n_rows, n_cols, i + 1, projection="3d")
+        if verts is not None:
+            ax.plot_trisurf(
+                verts[:, 0], verts[:, 1], verts[:, 2], triangles=faces,
+                color=surface_color, alpha=alpha, linewidth=0.0, shade=True,
+            )
+        else:
+            edges = [np.concatenate([c - h / 2, [c[-1] + h / 2]]) for c, h in zip(centers, steps)]
+            bx, by, bz = _boundary_voxel_centers(mask, edges)
+            ax.scatter(bx, by, bz, s=2, color=surface_color, alpha=0.4, linewidths=0)
+        if hole_xyz is not None:
+            ax.scatter(hole_xyz[:, 0], hole_xyz[:, 1], hole_xyz[:, 2],
+                       s=2, color=hole_color, alpha=0.6, linewidths=0, depthshade=False)
+        if polymer_points is not None and len(polymer_points):
+            ax.scatter(polymer_points[:, 0], polymer_points[:, 1], polymer_points[:, 2],
+                       s=6, c="red", depthshade=False, linewidths=0)
+        _setup_3d_axes(ax, box_lengths)
+        ax.view_init(elev=float(elev), azim=float(azim))
+        ax.set_title(f"elev={float(elev):.0f}, azim={float(azim):.0f}", fontsize=9)
+
+    fig.suptitle(title, fontsize=11)
+    extra = []
+
+    if write_html and verts is not None:
+        try:
+            import plotly.graph_objects as go
+            traces = [go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                color=surface_color, opacity=alpha, name="filled isosurface",
+                showlegend=True, hoverinfo="skip",
+            )]
+            if hole_xyz is not None:
+                traces.append(go.Scatter3d(
+                    x=hole_xyz[:, 0], y=hole_xyz[:, 1], z=hole_xyz[:, 2], mode="markers",
+                    marker=dict(size=2, color=hole_color), name="filled holes",
+                ))
+            if polymer_points is not None and len(polymer_points):
+                traces.append(go.Scatter3d(
+                    x=polymer_points[:, 0], y=polymer_points[:, 1], z=polymer_points[:, 2],
+                    mode="markers", marker=dict(size=3, color="red"), name="polymer",
+                ))
+            Lx, Ly, Lz = (float(v) for v in box_lengths)
+            html = go.Figure(data=traces)
+            html.update_layout(
+                title=title.replace("\n", "<br>"),
+                scene=dict(
+                    xaxis=dict(title="x [nm]", range=[-Lx / 2, Lx / 2]),
+                    yaxis=dict(title="y [nm]", range=[-Ly / 2, Ly / 2]),
+                    zaxis=dict(title="z [nm]", range=[-Lz / 2, Lz / 2]),
+                    aspectmode="data",
+                ),
+            )
+            html_path = os.path.join(output_dir, f"{basename}.html")
+            html.write_html(html_path)
+            extra.append(html_path)
+        except ImportError:
+            pass
+
+    written = _save_figure(fig, output_dir, basename, figure_format, extra=extra)
+    plt.close(fig)
+    return written
+
+
+def plot_two_color_field_3d(
+    entries,
+    centers,
+    *,
+    box_lengths,
+    output_dir,
+    basename,
+    title,
+    views=DENSITY3D_DEFAULT_VIEWS,
+    max_points=60000,
+    marker_size=5.0,
+    alpha_min=0.05,
+    alpha_power=1.4,
+    figure_format="png",
+    dpi=200,
+    rotate_gif=False,
+    gif_frames=36,
+    interactive=False,
+):
+    """
+    Overlay two species' thresholded fields in one set of 3D axes.
+
+    Each species keeps its own threshold, taken from its own 1D projections, so a
+    dense species and a sparse one are both visible.  Color encodes species and
+    alpha encodes concentration, which is what lets you see whether two cores
+    share one condensate or occupy separate ones.
+
+    `entries` is a list of dicts with keys: field, threshold, bounds, label,
+    color.
+    """
+    prepared = []
+    for index, entry in enumerate(entries):
+        cloud, effective, note = _resolve_display_threshold(
+            entry["field"], entry.get("threshold"), centers, max_points
+        )
+        if cloud is None:
+            continue
+        prepared.append({
+            "cloud": cloud,
+            "base_color": entry.get(
+                "color", DENSITY3D_SPECIES_COLORS[index % len(DENSITY3D_SPECIES_COLORS)]
+            ),
+            "label": entry.get("label", f"species {index}"),
+            "bounds": entry.get("bounds"),
+            "vmax": float(np.nanmax(np.asarray(entry["field"], dtype=float))),
+            "threshold": effective,
+            "note": note,
+        })
+
+    if len(prepared) < 2:
+        print(
+            f"Two-color plot skipped for {basename}: fewer than two species had "
+            "voxels above threshold."
+        )
+        return []
+
+    views = list(views) if views else list(DENSITY3D_DEFAULT_VIEWS)
+    n_cols = 2 if len(views) > 1 else 1
+    n_rows = int(np.ceil(len(views) / n_cols))
+    fig = plt.figure(figsize=(6.0 * n_cols, 5.4 * n_rows), dpi=dpi)
+
+    for i, (elev, azim) in enumerate(views):
+        ax = fig.add_subplot(n_rows, n_cols, i + 1, projection="3d")
+        for item in prepared:
+            _draw_cloud(
+                ax, item["cloud"], vmax=item["vmax"], base_color=item["base_color"],
+                marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+            )
+            if item["bounds"] is not None:
+                _draw_cuboid(ax, item["bounds"], color=item["base_color"], alpha=0.75, lw=0.8)
+        _setup_3d_axes(ax, box_lengths)
+        ax.view_init(elev=float(elev), azim=float(azim))
+        ax.set_title(f"elev={float(elev):.0f}, azim={float(azim):.0f}", fontsize=9)
+
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D(
+            [0], [0], marker="o", linestyle="none", color=item["base_color"],
+            markersize=7, label=f"{item['label']} (>= {item['threshold']:.3g})",
+        )
+        for item in prepared
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 3), fontsize=9, frameon=False)
+
+    notes = " ".join(item["note"] for item in prepared if item["note"])
+    fig.suptitle(f"{title}{(' ' + notes) if notes else ''}", fontsize=11)
+
+    extra = []
+    if rotate_gif:
+        gif_path = _write_field_rotation_gif(
+            prepared, box_lengths=box_lengths,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+            output_dir=output_dir, basename=basename, title=title,
+            n_frames=int(gif_frames), dpi=max(90, int(dpi // 2)),
+        )
+        if gif_path:
+            extra.append(gif_path)
+
+    if interactive:
+        _show_field_interactive(
+            prepared, box_lengths=box_lengths,
+            marker_size=marker_size, alpha_min=alpha_min, alpha_power=alpha_power,
+            title=title,
+        )
+
+    written = _save_figure(fig, output_dir, basename, figure_format, extra=extra)
+    plt.close(fig)
+    return written
+
+
+def _slice_indices(centers, bounds, field=None):
+    """
+    Grid indices to slice through, per axis.
+
+    Uses the center of the region when one is available; otherwise falls back to
+    the voxel of peak concentration, which keeps the slice on the condensate even
+    when no cuboid can be drawn in this coordinate frame.
+    """
+    if bounds is None:
+        if field is None:
+            return [int(len(centers[axis]) // 2) for axis in range(3)]
+        peak = np.unravel_index(int(np.nanargmax(np.asarray(field))), np.asarray(field).shape)
+        return [int(peak[axis]) for axis in range(3)]
+
+    indices = []
+    for axis in range(3):
+        target = 0.5 * (bounds[axis][0] + bounds[axis][1])
+        indices.append(int(np.argmin(np.abs(np.asarray(centers[axis]) - target))))
+    return indices
+
+
+def _slice_planes(field, centers, indices):
+    ix, iy, iz = indices
+    return [
+        ("x", "y", field[:, :, iz].T, centers[0], centers[1], 0, 1, f"z = {centers[2][iz]:.2f} nm"),
+        ("x", "z", field[:, iy, :].T, centers[0], centers[2], 0, 2, f"y = {centers[1][iy]:.2f} nm"),
+        ("y", "z", field[ix, :, :].T, centers[1], centers[2], 1, 2, f"x = {centers[0][ix]:.2f} nm"),
+    ]
+
+
+def plot_concentration_slices(
+    field,
+    centers,
+    *,
+    threshold,
+    bounds,
+    output_dir,
+    basename,
+    title,
+    polymer_xy=None,
+    polymer_points=None,
+    cmap_name="inferno",
+    figure_format="png",
+    dpi=200,
+):
+    """
+    Three orthogonal slices through the condensate center.
+
+    Cheap, fast, and free of 3D depth-ordering artifacts, so this is the panel
+    to trust when the scatter render looks ambiguous.
+    """
+    field = np.asarray(field, dtype=float)
+    indices = _slice_indices(centers, bounds, field=field)
+    vmax = float(np.nanmax(field))
+    cmap = plt.get_cmap(cmap_name)
+    norm = Normalize(vmin=0.0, vmax=vmax if vmax > 0 else 1.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=dpi)
+
+    for ax, (hlabel, vlabel, plane, haxis, vaxis, hi, vi, panel_title) in zip(
+        axes, _slice_planes(field, centers, indices)
+    ):
+        extent = [haxis[0], haxis[-1], vaxis[0], vaxis[-1]]
+        ax.imshow(plane, origin="lower", extent=extent, cmap=cmap, norm=norm, aspect="equal")
+
+        if np.isfinite(threshold):
+            ax.contour(haxis, vaxis, plane, levels=[float(threshold)], colors="cyan", linewidths=1.0)
+
+        if bounds is not None:
+            ax.add_patch(
+                plt.Rectangle(
+                    (bounds[hi][0], bounds[vi][0]),
+                    bounds[hi][1] - bounds[hi][0],
+                    bounds[vi][1] - bounds[vi][0],
+                    fill=False, edgecolor="white", linestyle="--", lw=0.9, alpha=0.8,
+                )
+            )
+
+        if polymer_points is not None and len(polymer_points):
+            # Beads within a couple of voxels of this plane, so a chain that
+            # wanders shows up as a spread of dots rather than one marker.
+            ni = 3 - hi - vi                       # the axis this panel slices along
+            normal_axis = np.asarray(centers[ni], dtype=float)
+            plane_value = float(normal_axis[indices[ni]])
+            slab_half = 2.0 * float(np.mean(np.diff(normal_axis)))
+            near = np.abs(polymer_points[:, ni] - plane_value) <= slab_half
+            if np.any(near):
+                ax.plot(
+                    polymer_points[near, hi], polymer_points[near, vi],
+                    linestyle="none", marker="o", markersize=2.5,
+                    color="red", alpha=0.85, zorder=4,
+                )
+
+        # One (x, y) or a list of them, one per fixed chain.
+        xy_list = []
+        if polymer_xy is not None:
+            xy_list = list(polymer_xy) if np.ndim(polymer_xy) == 2 else [polymer_xy]
+            xy_list = [xy for xy in xy_list if np.all(np.isfinite(xy))]
+        for xy in xy_list:
+            if (hi, vi) == (0, 1):
+                ax.plot(
+                    xy[0], xy[1], marker="x", color="red",
+                    markersize=13, markeredgewidth=2.5, linestyle="none",
+                    label="fixed polymer",
+                )
+            else:
+                # A chain runs along z, so it is a line in the xz and yz panels.
+                ax.axvline(xy[hi], color="red", lw=1.2, ls="--", alpha=0.9)
+
+        ax.set_xlabel(f"{hlabel} [nm]")
+        ax.set_ylabel(f"{vlabel} [nm]")
+        ax.set_title(panel_title, fontsize=10)
+
+    mappable = ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array([])
+    cbar = fig.colorbar(mappable, ax=axes, shrink=0.85, pad=0.02, fraction=0.03)
+    cbar.set_label("local volume fraction [dimensionless]")
+
+    threshold_text = f"{threshold:.4g}" if np.isfinite(threshold) else "n/a"
+    region_text = ", dashed = condensate cuboid" if bounds is not None else ""
+    if polymer_xy is not None and np.all(np.isfinite(polymer_xy)):
+        region_text += ", red X = fixed polymer" + ("s" if np.ndim(polymer_xy) == 2 else "")
+        
+    fig.suptitle(
+        f"{title}\ncyan = threshold {threshold_text}{region_text}",
+        fontsize=11,
+    )
+
+    written = _save_figure(fig, output_dir, basename, figure_format)
+    plt.close(fig)
+    return written
+
+
+def plot_two_color_slices(
+    entries,
+    centers,
+    *,
+    output_dir,
+    basename,
+    title,
+    figure_format="png",
+    dpi=200,
+):
+    """
+    Two-color composite slices: each species is mapped onto its own hue and the
+    hues are added, so overlap shows as a blend and separation shows as two
+    distinct blobs.  Complements the 3D overlay, which can hide one species
+    behind the other.
+    """
+    if len(entries) < 2:
+        return []
+
+    have_bounds = [e for e in entries if e.get("bounds") is not None]
+    if have_bounds:
+        union_bounds = {
+            axis: (
+                min(e["bounds"][axis][0] for e in have_bounds),
+                max(e["bounds"][axis][1] for e in have_bounds),
+            )
+            for axis in range(3)
+        }
+        indices = _slice_indices(centers, union_bounds)
+    else:
+        # No usable region in this frame: slice through the peak of the combined
+        # field so both species stay in view.
+        combined = np.zeros_like(np.asarray(entries[0]["field"], dtype=float))
+        for entry in entries:
+            field = np.asarray(entry["field"], dtype=float)
+            peak = float(np.nanmax(field))
+            combined += field / (peak if peak > 0 else 1.0)
+        indices = _slice_indices(centers, None, field=combined)
+
+    prepared = []
+    for index, entry in enumerate(entries):
+        field = np.asarray(entry["field"], dtype=float)
+        vmax = float(np.nanmax(field))
+        prepared.append({
+            "planes": _slice_planes(field, centers, indices),
+            "vmax": vmax if vmax > 0 else 1.0,
+            "color": np.asarray(
+                entry.get("color", DENSITY3D_SPECIES_COLORS[index % len(DENSITY3D_SPECIES_COLORS)]),
+                dtype=float,
+            ),
+            "label": entry.get("label", f"species {index}"),
+            "threshold": entry.get("threshold", np.nan),
+        })
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=dpi)
+
+    for panel_index, ax in enumerate(axes):
+        hlabel, vlabel, reference_plane, haxis, vaxis, _, _, panel_title = (
+            prepared[0]["planes"][panel_index]
+        )
+
+        composite = np.zeros(reference_plane.shape + (3,), dtype=float)
+        for item in prepared:
+            plane = item["planes"][panel_index][2]
+            intensity = np.clip(plane / item["vmax"], 0.0, 1.0)
+            composite += intensity[..., None] * item["color"][None, None, :]
+        composite = np.clip(composite, 0.0, 1.0)
+
+        extent = [haxis[0], haxis[-1], vaxis[0], vaxis[-1]]
+        ax.imshow(composite, origin="lower", extent=extent, aspect="equal")
+
+        for item in prepared:
+            if not np.isfinite(item["threshold"]):
+                continue
+            ax.contour(
+                haxis, vaxis, item["planes"][panel_index][2],
+                levels=[float(item["threshold"])],
+                colors=[tuple(np.clip(item["color"], 0.0, 1.0))],
+                linewidths=1.0, linestyles="--",
+            )
+
+        ax.set_xlabel(f"{hlabel} [nm]")
+        ax.set_ylabel(f"{vlabel} [nm]")
+        ax.set_title(panel_title, fontsize=10)
+
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([0], [0], marker="s", linestyle="none", color=tuple(item["color"]),
+               markersize=8, label=item["label"])
+        for item in prepared
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 3), fontsize=9, frameon=False)
+    fig.suptitle(f"{title}\ndashed contours = each species' own threshold", fontsize=11)
+
+    written = _save_figure(fig, output_dir, basename, figure_format)
+    plt.close(fig)
+    return written
+
+
+def plot_axis_profiles_3d(
+    profiles,
+    axis_results,
+    *,
+    species_ids,
+    type_names,
+    output_dir,
+    basename,
+    title,
+    thresholds=None,
+    bounds=None,
+    binseg_bounds=None,
+    shade_species=None,
+    prepare_config=None,
+):
+    """
+    Three-panel figure, one panel per axis.
+
+    `shade_species` selects whose detected region is shaded; other species are
+    still drawn as lines.  For a single-species figure that is the species
+    itself; for the all-species overview it is the reference species.  Thin
+    solid lines mark the raw Binseg segment whenever the region in use differs
+    from it (i.e. --density3d-extend-to-threshold is active).
+    """
+    thresholds = thresholds or {}
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), dpi=200, sharey=True)
+
+    for axis, ax in enumerate(axes):
+        centers = profiles["centers"][axis]
+        for s in species_ids:
+            ax.plot(centers, profiles["vf"][axis][s], lw=1.3, label=f"{s}: {type_names[s]}")
+
+        if shade_species is not None:
+            res = axis_results[shade_species][axis]
+            if res["detected"]:
+                used = (
+                    bounds[shade_species][axis] if bounds is not None
+                    else (res["in_min"], res["in_max"])
+                )
+                ax.axvspan(res["box_left"], res["buffer_min"], color="gray", alpha=0.20, label="Dilute")
+                ax.axvspan(used[0], used[1], color="red", alpha=0.25, label="Dense")
+                ax.axvspan(res["buffer_max"], res["box_right"], color="gray", alpha=0.20)
+                ax.axvline(used[0], color="black", ls="--", lw=0.9)
+                ax.axvline(used[1], color="black", ls="--", lw=0.9)
+
+                if binseg_bounds is not None and (
+                    abs(binseg_bounds[shade_species][axis][0] - used[0]) > 1e-9
+                    or abs(binseg_bounds[shade_species][axis][1] - used[1]) > 1e-9
+                ):
+                    ax.axvline(binseg_bounds[shade_species][axis][0], color="darkred", ls="-",
+                               lw=0.8, alpha=0.7, label="Binseg segment")
+                    ax.axvline(binseg_bounds[shade_species][axis][1], color="darkred", ls="-",
+                               lw=0.8, alpha=0.7)
+
+                note = f"dense=[{used[0]:.2f}, {used[1]:.2f}]\ncontrast={res['contrast']:.2f}"
+            else:
+                note = f"no condensate detected\n({res['reason']})"
+
+            ax.text(
+                0.02, 0.98, note,
+                transform=ax.transAxes, ha="left", va="top", fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            )
+
+        for s, value in thresholds.items():
+            if np.isfinite(value):
+                ax.axhline(value, color="teal", ls=":", lw=1.1,
+                           label=f"threshold {type_names[s]}")
+
+        ax.set_xlabel(f"{DENSITY3D_AXIS_NAMES[axis]} [{unit_label('length', prepare_config)}]")
+        ax.grid(alpha=0.3)
+
+    axes[0].set_ylabel("volume fraction [dimensionless]")
+    handles, labels = axes[0].get_legend_handles_labels()
+    seen = {}
+    for handle, text in zip(handles, labels):
+        seen.setdefault(text, handle)
+    axes[-1].legend(seen.values(), seen.keys(), fontsize=8, loc="upper right")
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+
+    path = os.path.join(output_dir, f"{basename}.svg")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return [path]
+
+
+DENSITY3D_FRAME_AGG_KEYS = (
+    "high_vf", "low_vf",
+    "field_threshold_vf", "field_threshold_otsu_vf",
+    "condensate_volume_nm3", "condensate_volume_binseg_nm3",
+    "condensate_volume_isosurface_nm3", "condensate_volume_isosurface_unfilled_nm3",
+    "condensate_hole_volume_nm3", "condensate_radius_equiv_nm",
+    "height_z", "width_x", "width_y", "width_xy", "aspect_ratio",
+    "high_vf_blob", "low_vf_blob",
+    "blob_dense_volume_nm3", "isosurface_particle_count",
+    "ref_isosurface_particle_count",
+    "field_dense_volume_nm3", "field_voxels_above_threshold",
+    "dense_vf_field_above_threshold", "field_occupancy_of_region",
+    "whole_box_vf", "projected_dense_vf", "projected_dilute_vf",
+    "mean_dense_particle_count", "buffered_volume_nm3", "dilute_volume_nm3",
+    "dense_vf_reference_cuboid", "dilute_vf_reference_cuboid",
+    "field_blobs_above_threshold", "largest_blob_fraction",
+    "polymer_x_nm", "polymer_y_nm", "polymer_x_lab_nm", "polymer_y_lab_nm",
+    "polymer_n_contacts", "polymer_contact_fraction", "polymer_min_distance_nm",
+    "polymer_n_core_beads_in", "polymer_n_core_beads_total", "dense_vf_cuboid_pol_corrected",
+)
+
+
+def aggregate_density3d_frames(frames_df, keys=DENSITY3D_FRAME_AGG_KEYS, detected_only=True):
+    """Mean and sample std (ddof=1) of each key over the analysed frames.
+
+    Only frames where the region used for that species was detected on all three
+    axes enter the statistics, unless no frame qualifies, in which case every
+    frame is used and the caller can see n_frames_detected = 0.
+    """
+    rows = frames_df
+    if detected_only and "detected" in frames_df.columns and bool(frames_df["detected"].any()):
+        rows = frames_df[frames_df["detected"].astype(bool)]
+
+    out = {}
+    for key in keys:
+        if key not in rows.columns:
+            continue
+        mean, std = _frame_mean_std(rows[key].to_numpy(dtype=float))
+        out[f"{key}_mean"] = mean
+        out[f"{key}_std"] = std
+    return out
+
+
+def density3d_analyze_frame(
+    traj,
+    index,
+    *,
+    species_ids,
+    reference_species,
+    box_lengths,
+    buffers,
+    n_bins,
+    smooth_window,
+    min_contrast,
+    max_width_fraction,
+    recenter,
+    recenter_species,
+    center_map,
+    refine,
+    extend_to_threshold,
+    threshold_fraction,
+    shared_region,
+    grid_shape,
+    sigma_nm,
+    threshold_axis_min_contrast,
+    optional_axis_min_contrast=1.7,  # implemented to limit the use of z-axis for high temp polymer runs
+    optional_axes=(),                # axes allowed to fail: full box extent, still "detected"
+    polymer_bead_typeids=(),
+    polymer_patch_typeids=(),
+    polymer_contact_scale=1.0,
+    polymer_contact_tolerance_nm=0.01,
+    cuboid_shrink_fraction=0,
+    polymer_chains=(),
+):
+    """
+    The complete 3D condensate analysis of ONE frame.
+
+    Runs, for that frame alone: the axis profiles, the Binseg detection, the
+    transverse refinement pass, the per-species threshold, the optional growth
+    of the cuboid to the threshold crossings, the particle-based dense and
+    dilute volume fractions, the Gaussian concentration field, the field
+    diagnostics, and the isosurface extents and volume.
+
+    Returns a dict with every intermediate object, so the caller can turn it
+    into a row of numbers and, for one chosen frame, also into figures.
+    """
+    axes = (0, 1, 2)    # Corresponding to x, y and z, respectively
+    species_ids = [int(s) for s in species_ids]
+    reference_species = int(reference_species)
+
+    # --- Pass A: profiles over the full box, all species ---------------------
+    profiles = accumulate_axis_profiles(
+        traj, species_ids,
+        start_frame=index, end_frame=index + 1,
+        n_bins=n_bins, box_lengths=box_lengths,
+        recenter=recenter, recenter_species=recenter_species,
+        center_map=center_map, restrict=None, progress=False,
+    )
+
+    def _axis_limits(axis):
+        if axis in optional_axes:
+            return optional_axis_min_contrast if optional_axis_min_contrast is not None else min_contrast
+        return min_contrast
+
+    def _detect_all(profile_data):
+        out = {}
+        for s in species_ids:
+            out[s] = {}
+            for axis in axes:
+                axis_contrast = _axis_limits(axis)
+                out[s][axis] = detect_dense_region_1d(
+                    profile_data["centers"][axis],
+                    profile_data["vf"][axis][s],
+                    transition_buffer=buffers[axis],
+                    smooth_window=smooth_window,
+                    min_contrast=axis_contrast,
+                    max_width_fraction=max_width_fraction,
+                )
+        return out
+
+    axis_results = _detect_all(profiles)
+    bounds, detected_axes = {}, {}
+    for s in species_ids:
+        bounds[s], _, detected_axes[s] = define_condensate_box(axis_results[s], box_lengths)
+
+    # Axes in optional_axes may fail without invalidating the frame: they take
+    # the full box extent, which is correct for a condensate that spans the box
+    # along that axis, such as one wetting a fixed polymer.
+    required_axes = [a for a in axes if a not in tuple(optional_axes)]
+    def _region_ok(results):
+        return all(results[a]["detected"] for a in required_axes)
+
+    fully_detected = [s for s in species_ids if _region_ok(axis_results[s])]
+    refined_species = []
+
+    # --- Pass B: refine each species against its own transverse ranges -------
+    if refine and fully_detected:
+        refined_profiles = accumulate_axis_profiles(
+            traj, species_ids,
+            start_frame=index, end_frame=index + 1,
+            n_bins=n_bins, box_lengths=box_lengths,
+            recenter=recenter, recenter_species=recenter_species,
+            center_map=center_map,
+            restrict={s: bounds[s] for s in fully_detected}, progress=False,
+        )
+        refined_results = _detect_all(refined_profiles)
+        for s in fully_detected:
+            if all(refined_results[s][axis]["detected"] for axis in required_axes):
+                for axis in axes:
+                    profiles["vf"][axis][s] = refined_profiles["vf"][axis][s]
+                axis_results[s] = refined_results[s]
+                bounds[s], _, detected_axes[s] = define_condensate_box(
+                    axis_results[s], box_lengths
+                )
+                refined_species.append(s)
+    region_ok = {s: _region_ok(axis_results[s]) for s in species_ids}
+
+    # --- Per-species thresholds from their own projections -------------------
+    thresholds, projected_high, projected_low = {}, {}, {}
+    threshold_axes = {}
+    for s in species_ids:
+        # Helper to bypass the filtering of the threshold_axis_min_contrast for high temp polymer runs
+        # TODO: ATTENTION: added a physical condition for the dilute projected volume fraction, but only on the z-axis for now, as that one gives the most problems when adding the polymer. Could add for all axes, but it needs to be thought about.
+        # Special z-condition: dilute fraction should be smaller or equal to the entire system's volume fraction
+        def _collect(use_contrast_gate):
+            highs, lows, used = [], [], []
+            for axis in axes:
+                res = axis_results[s][axis]
+                if not res["detected"]:
+                    continue
+                if (use_contrast_gate and threshold_axis_min_contrast is not None
+                        and np.isfinite(res["contrast"])
+                        and res["contrast"] < threshold_axis_min_contrast):
+                    continue
+                used.append(DENSITY3D_AXIS_NAMES[axis])
+                highs.append(average_profile_region(
+                    profiles["centers"][axis], profiles["vf"][axis][s],
+                    res["in_min"], res["in_max"],
+                ))
+                obtained_low = average_profile_outside_regions(
+                    profiles["centers"][axis], profiles["vf"][axis][s],
+                    res["box_left"], res["box_right"], res["buffer_min"], res["buffer_max"],
+                )
+                if axis == 2:
+                    if obtained_low > profiles["whole_box_vf"][s]:
+                        continue
+                lows.append(obtained_low)
+            return highs, lows, used
+        
+        highs, lows, used_axes = _collect(True)
+        if not used_axes:
+            # The contrast gate removed every axis; fall back to all detected ones.
+            highs, lows, used_axes = _collect(False)
+
+        projected_high[s] = float(np.nanmean(highs)) if highs else np.nan
+        projected_low[s] = float(np.nanmean(lows)) if lows else np.nan
+
+        thresholds[s] = condensate_threshold_from_profiles(
+            projected_low[s], projected_high[s], fraction=threshold_fraction
+        )
+        threshold_axes[s] = used_axes
+
+    # --- Optional: grow each cuboid out to the threshold crossings -----------
+    binseg_bounds = {s: {axis: tuple(bounds[s][axis]) for axis in axes} for s in species_ids}
+    binseg_volume = {s: _region_volume(binseg_bounds[s]) for s in species_ids}
+    extended = {s: False for s in species_ids}
+
+    if extend_to_threshold:
+        for s in species_ids:
+            if not np.isfinite(thresholds[s]):
+                continue
+            for axis in axes:
+                if not axis_results[s][axis]["detected"]:
+                    continue
+                new_bounds, changed = extend_bounds_to_threshold(
+                    profiles["centers"][axis], profiles["vf"][axis][s],
+                    bounds[s][axis], thresholds[s],
+                )
+                bounds[s][axis] = new_bounds
+                extended[s] = extended[s] or changed
+
+    # Testing shrinking the cuboid!
+    # Shrink each axis about its centre, to probe how much the cuboid's corners
+    # dilute high_vf.  shrink_fraction=0.1 keeps the central 90% of each axis.
+    # The dilute side keeps the detected cuboid, so shrinking the dense region
+    # never moves the buffer inward.
+    dilute_bounds = {s: {axis: tuple(bounds[s][axis]) for axis in axes}
+                     for s in species_ids}
+    if cuboid_shrink_fraction:
+        for s in species_ids:
+            for axis in axes:
+                lo, hi = bounds[s][axis]
+                mid = 0.5 * (lo + hi)
+                half = 0.5 * (hi - lo) * (1.0 - float(cuboid_shrink_fraction))
+                bounds[s][axis] = (mid - half, mid + half)
+
+    # --- Regions to measure --------------------------------------------------
+    regions = {
+        "reference": {
+            "bounds": bounds[reference_species],
+            "buffered": _buffered_bounds(dilute_bounds[reference_species], box_lengths, buffers),
+            "center_species": (
+                [reference_species] if center_map is None else center_map[reference_species]
+            ),
+        }
+    }
+    region_source = {}
+    for s in species_ids:
+        if shared_region or not region_ok[s]:
+            region_source[s] = "reference"
+        else:
+            region_source[s] = "self"
+            regions[f"species_{s}"] = {
+                "bounds": bounds[s],
+                "buffered": _buffered_bounds(dilute_bounds[s], box_lengths, buffers),
+                "center_species": (
+                    recenter_species if center_map is None else center_map[s]
+                ),
+            }
+
+    measured = measure_region_densities(
+        traj, species_ids, regions,
+        start_frame=index, end_frame=index + 1,
+        box_lengths=box_lengths,
+        recenter=recenter, recenter_species=recenter_species,
+        progress=False,
+    )
+
+    # --- Polymer excluded volume inside each measured cuboid -----------------
+    # The chain is a fixed obstacle, not part of either phase, so the space its
+    # hard cores occupy is not available to the patchy particles.  Only the
+    # bead volume (pi d^3 / 6) is subtracted; the LJ depletion shell is not,
+    # so the correction does not depend on the interaction settings.
+    polymer_volume_by_region = {}
+    if len(polymer_bead_typeids):
+        for key, region_def in regions.items():
+            pos, tids, vols, _ = _frame_positions_recentered(
+                traj[index], box_lengths, recenter, region_def["center_species"]
+            )
+            inside = np.isin(tids, polymer_bead_typeids)
+            for axis in axes:
+                lo, hi = region_def["bounds"][axis]
+                inside &= (pos[:, axis] >= lo) & (pos[:, axis] <= hi)
+            polymer_volume_by_region[key] = float(np.sum(vols[inside]))
+    else:
+        polymer_volume_by_region = {key: np.nan for key in regions}
+
+    # --- Concentration field of this frame, and what is derived from it ------
+    field_data = gaussian_concentration_field(
+        traj, species_ids,
+        frame_indices=[index], box_lengths=box_lengths,
+        grid_shape=grid_shape, sigma_nm=sigma_nm,
+        recenter=recenter, recenter_species=recenter_species,
+        progress=False,
+    )
+    voxel_volume = field_data["voxel_volume"]
+
+    field_stats, size_quant = {}, {}
+    for s in species_ids:
+        species_field = field_data["per_species"][s]
+        threshold = thresholds[s]
+
+        if np.isfinite(threshold):
+            above = np.isfinite(species_field) & (species_field >= threshold)
+        else:
+            above = np.zeros_like(species_field, dtype=bool)
+
+        n_above = int(np.count_nonzero(above))
+        region_key = f"species_{s}" if region_source[s] == "self" else "reference"
+        region_volume = measured[region_key]["cuboid_volume"]
+
+        sensitivity = {}
+        for label, frac in (("f035", 0.35), ("f065", 0.65)):
+            alt = condensate_threshold_from_profiles(
+                projected_low[s], projected_high[s], fraction=frac
+            )
+            if np.isfinite(alt):
+                alt_mask = np.isfinite(species_field) & (species_field >= alt)
+                sensitivity[label] = (
+                    alt,
+                    float(np.nanmean(species_field[alt_mask])) if np.any(alt_mask) else np.nan,
+                )
+            else:
+                sensitivity[label] = (np.nan, np.nan)
+
+        field_stats[s] = {
+            "n_above": n_above,
+            "dense_volume": n_above * voxel_volume,
+            "dense_vf": float(np.nanmean(species_field[above])) if n_above else np.nan,
+            "otsu": otsu_threshold(species_field),
+            "occupancy": (n_above * voxel_volume / region_volume) if region_volume > 0 else np.nan,
+            "sensitivity": sensitivity,
+            "region_key": region_key,
+        }
+        size_quant[s] = droplet_extents_mask(
+            species_field, field_data["centers"], threshold
+        )
+
+    # Particle counts inside the isosurface blob, in the same coordinates
+    isosurface_counts = {}
+    blob_densities = {}
+    field_positions, field_typeids, field_volumes, _ = _frame_positions_recentered(
+        traj[index], box_lengths, recenter, recenter_species
+    )
+    for s in species_ids:
+        isosurface_counts[s] = count_particles_in_mask(
+            field_positions, field_typeids, [s], size_quant[s]["mask"], field_data["centers"]
+        )[s]
+        blob_densities[s] = measure_blob_densities(
+            field_positions, field_typeids, field_volumes, [s],
+            size_quant[s]["mask"], field_data["centers"], field_data["voxel_volume"]
+        )[s]
+
+    # Every species counted inside the REFERENCE species' filled isosurface.
+    ref_isosurface_counts = count_particles_in_mask(
+        field_positions, field_typeids, species_ids,
+        size_quant[reference_species]["mask"], field_data["centers"]
+    )
+
+    # --- Fixed polymer: position in these coordinates, and its contacts -----
+    # --- This is done chain by chain, when there is more than one ---------------
+    polymer = None
+    polymer_per_chain = []
+    if len(polymer_chains) == 0:
+        if len(polymer_bead_typeids):
+            polymer = fixed_polymer_contacts(
+                traj[index],
+                reference_species=reference_species,
+                isosurface_counts=isosurface_counts,
+                bead_typeids=polymer_bead_typeids,
+                patch_typeids=polymer_patch_typeids,
+                box_lengths=box_lengths,
+                bounds=axis_results[reference_species],
+                bounds_contrast=threshold_axis_min_contrast,          # Uses the same minimum contrast as for determining threshold
+                recenter=recenter, recenter_species=recenter_species,
+                contact_scale=polymer_contact_scale,
+                contact_tolerance_nm=polymer_contact_tolerance_nm,
+            )
+    else:
+        for chain in polymer_chains:
+            polymer_per_chain.append((chain["label"], fixed_polymer_contacts(
+                traj[index],
+                reference_species=reference_species,
+                isosurface_counts=isosurface_counts,
+                bead_typeids=polymer_bead_typeids,
+                patch_typeids=polymer_patch_typeids,
+                box_lengths=box_lengths,
+                bounds=axis_results[reference_species],
+                bounds_contrast=threshold_axis_min_contrast,         # Uses the same minimum contrast as for determining threshold
+                recenter=recenter, recenter_species=recenter_species,
+                contact_scale=polymer_contact_scale,
+                contact_tolerance_nm=polymer_contact_tolerance_nm,
+                bead_tags=chain["core_tags"],
+            )))
+
+    try:
+        timestep = int(traj[index].configuration.step)
+    except (AttributeError, TypeError):
+        timestep = -1
+
+    return {
+        "index": int(index),
+        "timestep": timestep,
+        "reference_species": reference_species,
+        "profiles": profiles,
+        "axis_results": axis_results,
+        "bounds": bounds,
+        "detected_axes": detected_axes,
+        "refined_species": refined_species,
+        "binseg_bounds": binseg_bounds,
+        "binseg_volume": binseg_volume,
+        "extended": extended,
+        "thresholds": thresholds,
+        "threshold_axes": threshold_axes,
+        "projected_high": projected_high,
+        "projected_low": projected_low,
+        "regions": regions,
+        "region_ok": region_ok,
+        "region_source": region_source,
+        "measured": measured,
+        "field_data": field_data,
+        "field_stats": field_stats,
+        "size_quant": size_quant,
+        "isosurface_counts": isosurface_counts,
+        "ref_isosurface_counts": ref_isosurface_counts,
+        "field_positions": field_positions,     # recentred like the field; used by the droplet RDF
+        "field_typeids": field_typeids,
+        "blob_densities": blob_densities,
+        "polymer": polymer,
+        "polymer_per_chain": polymer_per_chain,
+        "polymer_volume_by_region": polymer_volume_by_region,
+    }
+
+
+def density3d_frame_row(state, s, *, box_lengths, buffers, wetting_width_nm=6.0):
+    """One frame's numbers for one species, as a flat dict for the frames CSV."""
+    axes = (0, 1, 2)
+    stats = state["field_stats"][s]
+    region = state["measured"][stats["region_key"]]
+    size = state["size_quant"][s]
+    region_owner_detected = (
+        state["region_ok"][s]
+        if state["region_source"][s] == "self"
+        else state["region_ok"][state["reference_species"]]
+    )
+
+    # Caluclating mass-balance as a check
+    vol_box = 1.0
+    for axis in axes:
+        vol_box *= float(box_lengths[axis])
+    blob_v_dense_mass_balance = vol_box * (state["profiles"]["whole_box_vf"][s] - state["blob_densities"][s]["dilute_vf"]) / (state["blob_densities"][s]["dense_vf"] - state["blob_densities"][s]["dilute_vf"])
+    cuboid_v_dense_mass_balance = vol_box * (state["profiles"]["whole_box_vf"][s] - region["dilute_vf"][s]) / (region["dense_vf"][s] - region["dilute_vf"][s])
+
+    # Excluding polymer volume for high_vf check
+    poly_volume = state["polymer_volume_by_region"].get(stats["region_key"], np.nan)
+    cuboid_volume = region["cuboid_volume"]
+    corrected_volume = (cuboid_volume - poly_volume) if np.isfinite(poly_volume) else np.nan
+
+    # Checking if wetting
+    has_polymer = bool((state.get("polymer") or {}).get("polymer_present", False))
+
+    row = {
+        "frame": state["index"],
+        "timestep": state["timestep"],
+        "detected": bool(region_owner_detected),
+        "species_detected_all_axes": len(state["detected_axes"][s]) == 3,
+        "condensate_detected_axes": ",".join(state["detected_axes"][s]),
+        "region_source": state["region_source"][s],
+        "refined": bool(s in state["refined_species"]),
+
+        "high_vf": region["dense_vf"][s],
+        "low_vf": region["dilute_vf"][s],
+        "dense_vf_cuboid": region["dense_vf"][s],
+        "dilute_vf_outside_buffer": region["dilute_vf"][s],
+        "dense_vf_reference_cuboid": state["measured"]["reference"]["dense_vf"][s],
+        "dilute_vf_reference_cuboid": state["measured"]["reference"]["dilute_vf"][s],
+        "mean_dense_particle_count": region["mean_dense_particle_count"][s],
+        "whole_box_vf": state["profiles"]["whole_box_vf"][s],
+
+        "projected_dense_vf": state["projected_high"][s],
+        "projected_dilute_vf": state["projected_low"][s],
+        "threshold_axes": ",".join(state["threshold_axes"][s]),
+        "field_threshold_vf": state["thresholds"][s],
+        "field_threshold_otsu_vf": stats["otsu"],
+        "dense_vf_field_above_threshold": stats["dense_vf"],
+        "field_dense_volume_nm3": stats["dense_volume"],
+        "field_voxels_above_threshold": stats["n_above"],
+        "field_occupancy_of_region": stats["occupancy"],
+        "threshold_sensitivity_f035_vf": stats["sensitivity"]["f035"][0],
+        "threshold_sensitivity_f035_dense_vf": stats["sensitivity"]["f035"][1],
+        "threshold_sensitivity_f065_vf": stats["sensitivity"]["f065"][0],
+        "threshold_sensitivity_f065_dense_vf": stats["sensitivity"]["f065"][1],
+
+        "condensate_volume_nm3": region["cuboid_volume"],
+        "condensate_volume_binseg_nm3": state["binseg_volume"][s],
+        "condensate_bounds_extended": bool(state["extended"][s]),
+        "buffered_volume_nm3": region["buffered_volume"],
+        "dilute_volume_nm3": region["outside_volume"],
+        "box_volume_nm3": region["box_volume"],
+
+        "polymer_volume_in_cuboid_nm3": poly_volume,
+        "polymer_volume_in_cuboid_percent": (
+            100.0 * poly_volume / cuboid_volume
+            if np.isfinite(poly_volume) and cuboid_volume > 0 else np.nan
+        ),
+        "dense_vf_cuboid_pol_corrected": (
+            region["dense_vf"][s] * cuboid_volume / corrected_volume
+            if np.isfinite(corrected_volume) and corrected_volume > 0 else np.nan
+        ),
+
+        "isosurface_particle_count": state["isosurface_counts"][s],
+        "ref_isosurface_particle_count": state["ref_isosurface_counts"][s],
+        "high_vf_blob": state["blob_densities"][s]["dense_vf"],
+        "low_vf_blob": state["blob_densities"][s]["dilute_vf"],
+        "blob_dense_volume_nm3": state["blob_densities"][s]["dense_volume_nm3"],
+        "blob_dilute_volume_nm3": state["blob_densities"][s]["dilute_volume_nm3"],
+        "blob_mass_balance_dense_volume_nm3": blob_v_dense_mass_balance,
+        "cuboid_mass_balance_dense_volume_nm3": cuboid_v_dense_mass_balance,
+        "condensate_volume_isosurface_nm3": size["volume_nm3"],
+        "condensate_volume_isosurface_unfilled_nm3": size["volume_raw_nm3"],
+        "condensate_hole_volume_nm3": size["hole_volume_nm3"],
+        "condensate_radius_equiv_nm": size["radius_equiv_nm"],
+        "field_blobs_above_threshold": size["n_blobs"],
+        "largest_blob_fraction": size["largest_blob_fraction"],
+        "height_z": size["H_z"],
+        "width_x": size["W_x"],
+        "width_y": size["W_y"],
+        "width_xy": size["W_xy"],
+        "aspect_ratio": size["aspect"],
+    }
+
+    polymer = state.get("polymer", None)
+    if polymer is not None:
+        row.update({
+            "polymer_present": bool(polymer["polymer_present"]),
+            "polymer_x_nm": polymer["x_nm"],
+            "polymer_y_nm": polymer["y_nm"],
+            "polymer_x_lab_nm": polymer["x_lab_nm"],
+            "polymer_y_lab_nm": polymer["y_lab_nm"],
+            "polymer_n_contacts": polymer["n_contacts"],
+            "polymer_contact_fraction": polymer["contact_fraction"],
+            "polymer_min_distance_nm": polymer["min_distance_nm"],
+            "polymer_n_core_beads_in": polymer["n_core_beads"],
+            "polymer_n_core_beads_total": polymer.get("n_core_beads_total", np.nan),
+        })
+
+    # One block of columns per chain: polymer1_*, polymer2_*, ...  The
+    # polymer_* columns above treat all chains as one object: contacts with
+    # ANY chain, the closest approach to ANY chain, all beads together.  A
+    # combined center of several chains is a point between them, so it is
+    # left empty when there is more than one.
+    per_chain = state.get("polymer_per_chain") or []
+    row["n_polymer_chains"] = len(per_chain) if per_chain else (1 if polymer is not None else 0)
+    if len(per_chain) > 1:
+        for key in ("polymer_x_nm", "polymer_y_nm", "polymer_x_lab_nm", "polymer_y_lab_nm"):
+            row[key] = np.nan
+    for k, (label, chain) in enumerate(per_chain, start=1):
+        prefix = f"polymer{k}_"
+        row[prefix + "label"] = label
+        row[prefix + "present"] = bool(chain["polymer_present"])
+        row[prefix + "x_nm"] = chain["x_nm"]
+        row[prefix + "y_nm"] = chain["y_nm"]
+        row[prefix + "x_lab_nm"] = chain["x_lab_nm"]
+        row[prefix + "y_lab_nm"] = chain["y_lab_nm"]
+        row[prefix + "n_contacts"] = chain["n_contacts"]
+        row[prefix + "contact_fraction"] = chain["contact_fraction"]
+        row[prefix + "min_distance_nm"] = chain["min_distance_nm"]
+        row[prefix + "n_core_beads_in"] = chain["n_core_beads"]
+        row[prefix + "n_core_beads_total"] = chain.get("n_core_beads_total", np.nan)
+
+    for axis in axes:
+        name = DENSITY3D_AXIS_NAMES[axis]
+        res = state["axis_results"][s][axis]
+        row[f"{name}_in_min"] = state["bounds"][s][axis][0]
+        row[f"{name}_in_max"] = state["bounds"][s][axis][1]
+        row[f"{name}_binseg_min"] = state["binseg_bounds"][s][axis][0]
+        row[f"{name}_binseg_max"] = state["binseg_bounds"][s][axis][1]
+        row[f"{name}_buffer_min"] = state["regions"][stats["region_key"]]["buffered"][axis][0]
+        row[f"{name}_buffer_max"] = state["regions"][stats["region_key"]]["buffered"][axis][1]
+        row[f"{name}_box_left"] = -float(box_lengths[axis]) / 2.0
+        row[f"{name}_box_right"] = float(box_lengths[axis]) / 2.0
+        row[f"{name}_transition_buffer_nm"] = buffers[axis]
+        row[f"{name}_detected"] = bool(res["detected"])
+        row[f"{name}_detection_note"] = res["reason"]
+        row[f"{name}_contrast"] = res["contrast"]
+        row[f"{name}_width_fraction"] = res["width_fraction"]
+        row[f"{name}_projected_dense_vf"] = res["high_vf"]
+        row[f"{name}_projected_dilute_vf"] = res["low_vf"]
+
+    # A condensate that is narrow in both x and y is a sleeve around the
+    # polymer rather than a droplet.  The widths come from the Binseg bounds,
+    # i.e. the detection itself, so neither the threshold extension nor
+    # cuboid_shrink_fraction changes the verdict.
+    width_x = row["x_binseg_max"] - row["x_binseg_min"]
+    width_y = row["y_binseg_max"] - row["y_binseg_min"]
+    width_z = row["z_binseg_max"] - row["z_binseg_min"]
+    row["detected_width_x_nm"] = width_x
+    row["detected_width_y_nm"] = width_y
+    row["detected_width_z_nm"] = width_z
+    row["just_wetting"] = bool(
+        has_polymer
+        and np.isfinite(width_x) and np.isfinite(width_y)
+        and width_x < float(wetting_width_nm)
+        and width_y < float(wetting_width_nm)
+        and width_z > float(2*wetting_width_nm)
+    )
+
+    return row
+
+
+def analyze_density_3d(
+    traj_file,
+    species_ids=None,
+    reference_species=None,
+    n_bins=100,
+    top_percentage=0.0,              # % of last frames over which the droplet is averaged
+    last_frames=10,                # if set, use exactly the last N frames (overrides top_percentage)
+    transition_buffer=10.0,
+    buffer_box_fraction=0.1,
+    smooth_window=9,
+    min_contrast=1.5,
+    max_width_fraction=0.9,
+    recenter=True,
+    recenter_per_species=False,
+    refine=True,
+    extend_to_threshold=False,
+    shared_region=False,
+    voxel_nm=0.5,
+    grid=None,
+    sigma_nm=1.0,
+    threshold_axis_min_contrast=4.0,
+    field_frame=None,                # frame the figures are made from (alias of plot_frame)
+    field_frames=1,                  # kept for compatibility; ignored, fields are per frame
+    plot_frame=None,                 # frame the figures are made from; default = last analysed
+    polymer_bead_names=DEFAULT_POLYMER_BEAD_NAMES,
+    polymer_patch_markers=("patch",),
+    polymer_contact_scale=1.0,
+    polymer_contact_tolerance_nm=0.01,
+    wetting_width_nm=6.0,            # x and y both narrower than this -> wetting
+    wetting_min_frames=6,            # that many frames make the whole run wetting
+    mark_polymer=True,               # draw the polymer as a red X on the slice figures
+    region_cache=None,               # dict filled per frame with the condensate mask, for the droplet RDF
+    polymer_z_optional=True,
+    threshold_fraction=0.5,
+    max_points=60000,
+    marker_size=5.0,
+    views=None,
+    figure_format="png",
+    make_slices=True,
+    two_color=True,
+    max_two_color_pairs=6,
+    plot_all_species=False,
+    rotate_gif=False,
+    interactive=False,
+    save_field=False,
+    output_dir=".",
+    plot=False,
+    plot_isosurface_3d=False,
+    prepare_config=None,
+):
+    """
+    Full 3D density analysis for one trajectory, core species by core species.
+
+    Patch densities are never analyzed, saved, or plotted by this function.
+    Populated core types, particle sizes, positions, bonds, and box dimensions
+    are read from the GSD.  prepare.py is used only as a legacy fallback when
+    the GSD names/topology cannot identify a core type.
+
+    Every frame in the window is analysed on its own: its axis profiles, Binseg
+    detection, refinement, threshold, cuboid, particle-based dense and dilute
+    volume fractions, concentration field, field diagnostics and isosurface
+    volume all come from that frame alone.  This suits trajectories whose
+    frames are far apart in time, where averaging profiles or fields over the
+    window would mix configurations that have nothing to do with each other.
+    The summary CSV reports the mean and the sample std (ddof=1) over the
+    frames where the condensate was detected, and the per-frame values are
+    written to a frames CSV next to it.  Figures are made from a single frame,
+    the last one analysed unless plot_frame says otherwise.
+
+    Writes one profile CSV, one frames CSV, one summary CSV and (with
+    plot=True) one profile figure, one 3D field figure and one slice figure per species, each carrying
+    the species in its file name and column headers:
+
+        {traj}_type_{id}_{name}_density3d_profiles.csv
+        {traj}_type_{id}_{name}_density3d_frames.csv
+        {traj}_type_{id}_{name}_density3d_summary.csv
+        {traj}_type_{id}_{name}_density3d_profiles.svg
+        {traj}_type_{id}_{name}_density3d_field.png
+        {traj}_type_{id}_{name}_density3d_slices.png
+
+    plus an all-species profile overview and, when two or more core species have
+    their own condensate, a two-color 3D overlay and a composite slice figure per
+    pair:
+
+        {traj}_type_{a}_{nameA}_vs_type_{b}_{nameB}_density3d_field_2color.png
+        {traj}_type_{a}_{nameA}_vs_type_{b}_{nameB}_density3d_slices_2color.png
+
+    The phase-diagram columns low_vf and high_vf carry the dilute value from
+    outside the buffered cuboid and the dense value from inside the cuboid
+    intersection, both measured directly from particle positions, in that
+    species' own region unless shared_region=True.  The field-derived dense value
+    is reported separately as a diagnostic only.
+
+    recenter_per_species=True detects and measures each species in a frame
+    centered on that species' own center of mass.  This matters when two
+    condensates drift independently: a frame centered on species A smears
+    species B, widening B's detected region and diluting its density.  The
+    concentration fields and all figures stay in the single reference frame so
+    that species remain spatially comparable, which means a per-species cuboid
+    is not drawn on the field figures in this mode.
+
+    Returns (profiles_by_species, summary_df) where profiles_by_species maps
+    each core typeid to its profile DataFrame and summary_df concatenates every
+    core species' summary row.
+    """
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+    axes = (0, 1, 2)
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+        type_names = {s: typeid_to_name(first, s) for s in all_typeids(first)}
+
+        if species_ids is None:
+            requested_species_ids = all_typeids(first)
+        else:
+            requested_species_ids = [int(s) for s in species_ids]
+
+        output_species_ids = density3d_core_species(
+            first, requested_species_ids, prepare_config=prepare_config
+        )
+
+        # The fixed polymer is never a density species: its beads are excluded
+        # from the profiles, cuboids, fields and summaries, and handled only by
+        # fixed_polymer_contacts().  Type names are read from the last frame,
+        # because the polymer may be absent from frame 0.
+        polymer_cores, polymer_patches = polymer_typeids(
+            traj[len(traj) - 1],
+            polymer_bead_names=polymer_bead_names,
+            patch_name_markers=polymer_patch_markers,
+        )
+        if len(polymer_patches) == 0:
+            polymer_contact_scale = 2**(1/6)       # If no patches on polymer, the potential used was LJ! There are no trajectories both with patches on polymer and LJ. TODO: change this to be modified per polymer when multiple fixed polymers
+        polymer_all = set(polymer_cores) | set(polymer_patches)
+        dropped_polymer = [s for s in output_species_ids if s in polymer_all]
+        if dropped_polymer:
+            print(
+                "3D density excludes the fixed polymer: "
+                + ", ".join(f"{s}:{type_names[s]}" for s in dropped_polymer)
+            )
+        output_species_ids = [s for s in output_species_ids if s not in polymer_all]
+        if not output_species_ids:
+            raise ValueError(
+                "3D density found no populated core types once the fixed polymer "
+                "was excluded."
+            )
+        optional_axes = (2,) if (polymer_cores and polymer_z_optional) else ()
+
+        # Split the fixed polymer beads into chains once, from the last frame;
+        # tags never change, so the same chains are followed in every frame.
+        polymer_chains = (
+            split_polymer_chains(traj[len(traj) - 1], polymer_cores, polymer_patches)
+            if polymer_cores else []
+        )
+        if len(polymer_chains) > 1:
+            print(
+                f"Fixed polymers: {len(polymer_chains)} chains -> "
+                + ", ".join(
+                    f"polymer{k}={c['label']} ({len(c['core_tags'])} core beads)"
+                    for k, c in enumerate(polymer_chains, start=1)
+                )
+            )
+        else:
+            polymer_chains = []          # one chain: the combined columns already cover it
+        
+        skipped_species = [
+            s for s in requested_species_ids if s not in set(output_species_ids)
+        ]
+        if skipped_species:
+            print(
+                "3D density ignores non-core/empty types from the GSD: "
+                + ", ".join(f"{s}:{type_names[s]}" for s in skipped_species)
+            )
+        if not output_species_ids:
+            requested_text = ", ".join(
+                f"{s}:{type_names[s]}" for s in requested_species_ids
+            )
+            raise ValueError(
+                "3D density found no populated core particle types in the GSD "
+                f"among the requested types ({requested_text}). Patch densities "
+                "are intentionally excluded."
+            )
+
+        if reference_species is None:
+            reference_species = output_species_ids[0]
+        else:
+            reference_species = int(reference_species)
+            if reference_species not in output_species_ids:
+                print(
+                    f"3D reference {reference_species}:{type_names[reference_species]} is not "
+                    "a requested populated core; using "
+                    f"{output_species_ids[0]}:{type_names[output_species_ids[0]]} instead."
+                )
+                reference_species = output_species_ids[0]
+
+        profile_species = list(output_species_ids)
+        recenter_species = [reference_species]
+        center_map = {s: [s] for s in profile_species} if recenter_per_species else None
+        core_species = list(output_species_ids)
+
+        n_frames = len(traj)
+        start_frame, end_frame = density3d_frame_range(
+            n_frames, top_percentage, last_frames=last_frames
+        )
+        box_lengths = np.asarray(traj[start_frame].configuration.box[:3], dtype=float)
+
+        buffers = []
+        for axis in axes:
+            cap = float(buffer_box_fraction) * float(box_lengths[axis])
+            buffers.append(min(float(transition_buffer), cap))
+        if any(b < float(transition_buffer) - 1e-9 for b in buffers):
+            print(
+                f"Transition buffer clamped to {buffer_box_fraction:.0%} of each box length: "
+                + ", ".join(f"{DENSITY3D_AXIS_NAMES[a]}={buffers[a]:.2f} nm" for a in axes)
+                + f" (requested {float(transition_buffer):.2f} nm). "
+                "A large buffer leaves no dilute bins in a small box."
+            )
+
+        print(
+            f"Frames {start_frame}-{n_frames - 1} of {n_frames}; "
+            f"box = {box_lengths[0]:.2f} x {box_lengths[1]:.2f} x {box_lengths[2]:.2f} nm; "
+            f"recentering {'on' if recenter else 'off'}"
+        )
+        print(f"Core species: {', '.join(f'{s}:{type_names[s]}' for s in output_species_ids)}")
+
+        # --- Per-frame analysis ---------------------------------------------
+        frame_indices = list(range(start_frame, end_frame))
+        grid_shape = density3d_grid_shape(box_lengths, voxel_nm=voxel_nm, grid=grid)
+
+        if plot_frame is not None:
+            plot_index = int(np.clip(int(plot_frame), frame_indices[0], frame_indices[-1]))
+        elif field_frame is not None:
+            plot_index = int(np.clip(int(field_frame), frame_indices[0], frame_indices[-1]))
+        else:
+            plot_index = frame_indices[-1]
+        if int(field_frames) > 1:
+            print(
+                "Note: field_frames is ignored; every frame gets its own concentration "
+                "field and the figures come from a single frame."
+            )
+
+        print(
+            f"Per-frame analysis of {len(frame_indices)} frames "
+            f"({frame_indices[0]}-{frame_indices[-1]}); concentration field grid "
+            f"{grid_shape[0]}x{grid_shape[1]}x{grid_shape[2]}, sigma={sigma_nm} nm; "
+            f"figures from frame {plot_index}"
+        )
+
+        frame_rows = {s: [] for s in output_species_ids}
+        plot_state = None
+
+        for index in tqdm(frame_indices, desc="3D density per frame", leave=False):
+            state = density3d_analyze_frame(
+                traj, index,
+                species_ids=output_species_ids,
+                reference_species=reference_species,
+                box_lengths=box_lengths, buffers=buffers, n_bins=n_bins,
+                smooth_window=smooth_window, min_contrast=min_contrast,
+                max_width_fraction=max_width_fraction,
+                recenter=recenter, recenter_species=recenter_species,
+                center_map=center_map, refine=refine,
+                extend_to_threshold=extend_to_threshold,
+                threshold_fraction=threshold_fraction,
+                shared_region=shared_region,
+                grid_shape=grid_shape, sigma_nm=sigma_nm,
+                threshold_axis_min_contrast=threshold_axis_min_contrast,
+                optional_axes=optional_axes,
+                polymer_bead_typeids=polymer_cores,
+                polymer_patch_typeids=polymer_patches,
+                polymer_contact_scale=polymer_contact_scale,
+                polymer_contact_tolerance_nm=polymer_contact_tolerance_nm,
+                polymer_chains=polymer_chains,
+            )
+
+            for s in output_species_ids:
+                frame_rows[s].append(
+                    density3d_frame_row(state, s, box_lengths=box_lengths, buffers=buffers,
+                                        wetting_width_nm=wetting_width_nm)
+                )
+
+            if region_cache is not None:
+                # What the droplet RDF needs from this frame: the reference
+                # species' filled isosurface mask on the field grid, and the
+                # positions in the same recentred coordinates as that grid.
+                ref_size = state["size_quant"][reference_species]
+                region_cache[int(index)] = {
+                    "mask": ref_size.get("mask"),
+                    "centers": state["field_data"]["centers"],
+                    "positions": np.asarray(state["field_positions"], dtype=float),
+                    "typeids": np.asarray(state["field_typeids"], dtype=int),
+                    "inside_volume_nm3": float(ref_size.get("volume_nm3", np.nan)),
+                    "box_lengths": np.asarray(box_lengths, dtype=float),
+                    "box": traj[index].configuration.box,
+                    "reference_species": int(reference_species),
+                    "polymer_typeids": sorted(int(t) for t in polymer_all),
+                    "buffers_nm": [float(b) for b in buffers],
+                    "buffer_axes": [DENSITY3D_AXIS_NAMES.index(a)
+                                    for a in state["detected_axes"][reference_species]],
+                }
+
+            if index == plot_index:
+                plot_state = state
+
+        if plot_state is None:
+            plot_state = state
+
+    # Everything below describes the frame the figures come from; the numbers
+    # for the phase diagram are aggregated from every frame further down.
+    profiles = plot_state["profiles"]
+    axis_results = plot_state["axis_results"]
+    bounds = plot_state["bounds"]
+    detected_axes = plot_state["detected_axes"]
+    refined_species = plot_state["refined_species"]
+    binseg_bounds = plot_state["binseg_bounds"]
+    binseg_volume = plot_state["binseg_volume"]
+    extended = plot_state["extended"]
+    thresholds = plot_state["thresholds"]
+    projected_high = plot_state["projected_high"]
+    projected_low = plot_state["projected_low"]
+    regions = plot_state["regions"]
+    region_source = plot_state["region_source"]
+    measured = plot_state["measured"]
+    field_data = plot_state["field_data"]
+    field_stats = plot_state["field_stats"]
+    voxel_volume = field_data["voxel_volume"]
+    total_field = field_data["total"]
+    field_indices = [plot_index]
+
+    # --- What the figure frame looks like -----------------------------------
+    print(f"Frame {plot_index} (the frame the figures come from):")
+    for s in output_species_ids:
+        name = f"{s}:{type_names[s]}"
+        if len(detected_axes[s]) == 3:
+            extent = ", ".join(
+                f"{DENSITY3D_AXIS_NAMES[a]}=[{bounds[s][a][0]:.2f}, {bounds[s][a][1]:.2f}]"
+                for a in axes
+            )
+            contrasts = ", ".join(
+                f"{DENSITY3D_AXIS_NAMES[a]}={axis_results[s][a]['contrast']:.1f}" for a in axes
+            )
+            print(f"  {name}: condensate {extent}; contrast {contrasts}"
+                  + ("; refined" if s in refined_species else "")
+                  + ("; extended to threshold" if extended[s] else ""))
+        else:
+            missing = [
+                DENSITY3D_AXIS_NAMES[a] for a in axes if not axis_results[s][a]["detected"]
+            ]
+            reasons = "; ".join(
+                f"{DENSITY3D_AXIS_NAMES[a]}: {axis_results[s][a]['reason']}"
+                for a in axes if not axis_results[s][a]["detected"]
+            )
+            print(
+                f"  {name}: no condensate on {','.join(missing)} "
+                f"(full box extent used) -> {reasons}"
+            )
+
+        if (recenter and not recenter_per_species and s != reference_species
+                and len(detected_axes[s]) == 3):
+            wide = [
+                DENSITY3D_AXIS_NAMES[a] for a in axes
+                if np.isfinite(axis_results[s][a]["width_fraction"])
+                and axis_results[s][a]["width_fraction"] > 0.4
+            ]
+            if wide:
+                print(
+                    f"  WARNING {name}: dense region spans more than 40% of the box along "
+                    f"{','.join(wide)} while frames are centered on "
+                    f"{reference_species}:{type_names[reference_species]}. If this species "
+                    "forms its own condensate that drifts independently, the shared frame "
+                    "smears it and dilutes its density; try --density3d-recenter-per-species."
+                )
+
+    # --- CSVs, one profile, one frames and one summary file per species -----
+    profiles_by_species = {}
+    summary_records = []
+
+    total_profiles = {
+        axis: np.sum([profiles["vf"][axis][s] for s in output_species_ids], axis=0)
+        for axis in axes
+    }
+
+    for s in output_species_ids:
+        tag = species_tag(s, type_names[s])
+        stats = field_stats[s]
+        region = measured[stats["region_key"]]
+
+        blocks = []
+        for axis in axes:
+            block = pd.DataFrame({
+                "axis": DENSITY3D_AXIS_NAMES[axis],
+                "position_nm": profiles["centers"][axis],
+            })
+            block["typeid"] = s
+            block["type_name"] = type_names[s]
+            block[f"{tag}_volume_fraction"] = profiles["vf"][axis][s]
+            block[f"{tag}_whole_box_vf"] = profiles["whole_box_vf"][s]
+            block[f"{tag}_condensate_min_nm"] = bounds[s][axis][0]
+            block[f"{tag}_condensate_max_nm"] = bounds[s][axis][1]
+            block[f"{tag}_axis_condensate_detected"] = bool(axis_results[s][axis]["detected"])
+            block[f"{tag}_field_threshold_vf"] = thresholds[s]
+            block["all_species_total_volume_fraction"] = total_profiles[axis]
+            blocks.append(block)
+
+        species_profiles = pd.concat(blocks, ignore_index=True)
+        species_profiles["trajname"] = trajname
+        species_profiles["kT_kJ_per_mol"] = kT
+        species_profiles["frame"] = plot_index
+        species_profiles["refined"] = bool(s in refined_species)
+        species_profiles["recentered"] = bool(recenter)
+        species_profiles["region_source"] = region_source[s]
+        species_profiles = add_hoomd_unit_metadata(species_profiles, prepare_config=prepare_config)
+
+        profiles_path = os.path.join(output_dir, f"{trajname}_{tag}_density3d_profiles.csv")
+        species_profiles.to_csv(profiles_path, index=False)
+        profiles_by_species[s] = species_profiles
+
+        # Every frame's numbers, the table the summary is aggregated from.
+        frames_df = pd.DataFrame(frame_rows[s])
+        frames_df.insert(0, "trajname", trajname)
+        frames_df.insert(1, "kT_kJ_per_mol", kT)
+        frames_df.insert(2, "typeid", s)
+        frames_df.insert(3, "type_name", type_names[s])
+        frames_df.to_csv(
+            os.path.join(output_dir, f"{trajname}_{tag}_density3d_frames.csv"), index=False
+        )
+
+        chain_columns = tuple(
+            f"polymer{k}_{name}"
+            for k in range(1, len(polymer_chains) + 1)
+            for name in POLYMER_CHAIN_COLUMNS
+        )
+        agg = aggregate_density3d_frames(
+            frames_df, keys=tuple(DENSITY3D_FRAME_AGG_KEYS) + chain_columns
+        )
+        n_detected = int(frames_df["detected"].astype(bool).sum())
+
+        n_wetting = int(frames_df["just_wetting"].astype(bool).sum())
+
+        record = {
+            "trajname": trajname,
+            "kT_kJ_per_mol": kT,
+            "typeid": s,
+            "type_name": type_names[s],
+            "species_tag": tag,
+            "reference_typeid": reference_species,
+            "reference_type_name": type_names[reference_species],
+            "is_core_species": s in core_species,
+
+            # Frame bookkeeping.  Every quantity below is a mean over the
+            # frames where the condensate was detected, with the sample std
+            # (ddof=1) in the matching _std column; the per-frame values are in
+            # the *_density3d_frames.csv file.
+            "n_frames_analysed": len(frame_indices),
+            "n_frames_detected": n_detected,
+            "first_frame_analysed": frame_indices[0],
+            "last_frame_analysed": frame_indices[-1],
+            "figure_frame": plot_index,
+            "per_frame_analysis": True,
+
+            "whole_box_vf": agg["whole_box_vf_mean"],
+            "whole_box_vf_std": agg["whole_box_vf_std"],
+
+            # Phase-diagram columns: cuboid intersection, particle-based.
+            "low_vf": agg["low_vf_mean"],
+            "high_vf": agg["high_vf_mean"],
+            "low_vf_mean": agg["low_vf_mean"],
+            "low_vf_std": agg["low_vf_std"],
+            "high_vf_mean": agg["high_vf_mean"],
+            "high_vf_std": agg["high_vf_std"],
+            "dense_vf_cuboid": agg["high_vf_mean"],
+            "dilute_vf_outside_buffer": agg["low_vf_mean"],
+            "region_source": region_source[s],
+
+            # The same quantities in the reference species' cuboid.
+            "dense_vf_reference_cuboid": agg["dense_vf_reference_cuboid_mean"],
+            "dense_vf_reference_cuboid_std": agg["dense_vf_reference_cuboid_std"],
+            "dilute_vf_reference_cuboid": agg["dilute_vf_reference_cuboid_mean"],
+            "dilute_vf_reference_cuboid_std": agg["dilute_vf_reference_cuboid_std"],
+            "dense_vf_cuboid_pol_corrected": agg.get("dense_vf_cuboid_pol_corrected_mean", np.nan),
+            "dense_vf_cuboid_pol_corrected_std": agg.get("dense_vf_cuboid_pol_corrected_std", np.nan),
+
+            # Blob-based phase densities: same particle counting as
+            # high_vf/low_vf, but the region is the isosurface blob rather
+            # than the cuboid.
+            "high_vf_blob": agg.get("high_vf_blob_mean", np.nan),
+            "high_vf_blob_std": agg.get("high_vf_blob_std", np.nan),
+            "low_vf_blob": agg.get("low_vf_blob_mean", np.nan),
+            "low_vf_blob_std": agg.get("low_vf_blob_std", np.nan),
+            "blob_dense_volume_nm3": agg.get("blob_dense_volume_nm3_mean", np.nan),
+            "blob_dense_volume_nm3_std": agg.get("blob_dense_volume_nm3_std", np.nan),
+            "isosurface_particle_count": agg.get("isosurface_particle_count_mean", np.nan),
+            "isosurface_particle_count_std": agg.get("isosurface_particle_count_std", np.nan),
+            "ref_isosurface_particle_count": agg.get("ref_isosurface_particle_count_mean", np.nan),
+            "ref_isosurface_particle_count_std": agg.get("ref_isosurface_particle_count_std", np.nan),
+            "blob_erode_voxels": plot_state["blob_densities"][s]["blob_erode_voxels"],
+            "blob_buffer_voxels": plot_state["blob_densities"][s]["blob_buffer_voxels"],
+
+            # Diagnostics, not consumed by the phase diagram.
+            "dense_vf_field_above_threshold": agg["dense_vf_field_above_threshold_mean"],
+            "dense_vf_field_above_threshold_std": agg["dense_vf_field_above_threshold_std"],
+            "mean_dense_particle_count": agg["mean_dense_particle_count_mean"],
+            "mean_dense_particle_count_std": agg["mean_dense_particle_count_std"],
+            "projected_dense_vf": agg["projected_dense_vf_mean"],
+            "projected_dense_vf_std": agg["projected_dense_vf_std"],
+            "projected_dilute_vf": agg["projected_dilute_vf_mean"],
+            "projected_dilute_vf_std": agg["projected_dilute_vf_std"],
+            "threshold_axes": ",".join(plot_state["threshold_axes"][s]),
+            "threshold_axis_min_contrast": (
+                threshold_axis_min_contrast if threshold_axis_min_contrast is not None else np.nan
+            ),
+            "field_threshold_vf": agg["field_threshold_vf_mean"],
+            "field_threshold_vf_std": agg["field_threshold_vf_std"],
+            "field_threshold_fraction": threshold_fraction,
+            "field_threshold_otsu_vf": agg["field_threshold_otsu_vf_mean"],
+            "field_threshold_otsu_vf_std": agg["field_threshold_otsu_vf_std"],
+            "field_dense_volume_nm3": agg["field_dense_volume_nm3_mean"],
+            "field_dense_volume_nm3_std": agg["field_dense_volume_nm3_std"],
+            "field_voxels_above_threshold": agg["field_voxels_above_threshold_mean"],
+            "field_occupancy_of_region": agg["field_occupancy_of_region_mean"],
+            "field_occupancy_of_region_std": agg["field_occupancy_of_region_std"],
+
+            # Cuboid and isosurface volumes.
+            "condensate_volume_nm3": agg["condensate_volume_nm3_mean"],
+            "condensate_volume_nm3_std": agg["condensate_volume_nm3_std"],
+            "condensate_volume_binseg_nm3": agg["condensate_volume_binseg_nm3_mean"],
+            "condensate_volume_binseg_nm3_std": agg["condensate_volume_binseg_nm3_std"],
+            "condensate_volume_isosurface_nm3": agg["condensate_volume_isosurface_nm3_mean"],
+            "condensate_volume_isosurface_nm3_std": agg["condensate_volume_isosurface_nm3_std"],
+            "condensate_volume_isosurface_unfilled_nm3":
+                agg["condensate_volume_isosurface_unfilled_nm3_mean"],
+            "condensate_volume_isosurface_unfilled_nm3_std":
+                agg["condensate_volume_isosurface_unfilled_nm3_std"],
+            "condensate_hole_volume_nm3": agg["condensate_hole_volume_nm3_mean"],
+            "condensate_hole_volume_nm3_std": agg["condensate_hole_volume_nm3_std"],
+            "condensate_radius_equiv_nm": agg["condensate_radius_equiv_nm_mean"],
+            "condensate_radius_equiv_nm_std": agg["condensate_radius_equiv_nm_std"],
+            "field_blobs_above_threshold": agg["field_blobs_above_threshold_mean"],
+            "largest_blob_fraction": agg["largest_blob_fraction_mean"],
+            "buffered_volume_nm3": agg["buffered_volume_nm3_mean"],
+            "dilute_volume_nm3": agg["dilute_volume_nm3_mean"],
+            "box_volume_nm3": region["box_volume"],
+
+            # Droplet shape.
+            "height_z": agg["height_z_mean"],
+            "height_z_std": agg["height_z_std"],
+            "width_x": agg["width_x_mean"],
+            "width_x_std": agg["width_x_std"],
+            "width_y": agg["width_y_mean"],
+            "width_y_std": agg["width_y_std"],
+            "width_xy": agg["width_xy_mean"],
+            "width_xy_std": agg["width_xy_std"],
+            "aspect_ratio (H_z/W_xy)": agg["aspect_ratio_mean"],
+            "aspect_ratio_std": agg["aspect_ratio_std"],
+
+            "just_wetting": bool(n_wetting >= int(wetting_min_frames)),
+            "n_frames_just_wetting": n_wetting,
+            "wetting_width_nm": wetting_width_nm,
+
+            # Fixed polymer, mean and std over the analysed frames; the
+            # per-frame values are in the frames CSV.
+            "polymer_present": bool(
+                (plot_state.get("polymer") or {}).get("polymer_present", False)
+            ),
+            "polymer_x_nm": agg.get("polymer_x_nm_mean", np.nan),
+            "polymer_x_nm_std": agg.get("polymer_x_nm_std", np.nan),
+            "polymer_y_nm": agg.get("polymer_y_nm_mean", np.nan),
+            "polymer_y_nm_std": agg.get("polymer_y_nm_std", np.nan),
+            "polymer_x_lab_nm": agg.get("polymer_x_lab_nm_mean", np.nan),
+            "polymer_y_lab_nm": agg.get("polymer_y_lab_nm_mean", np.nan),
+            "polymer_n_contacts": agg.get("polymer_n_contacts_mean", np.nan),
+            "polymer_n_contacts_std": agg.get("polymer_n_contacts_std", np.nan),
+            "polymer_contact_fraction": agg.get("polymer_contact_fraction_mean", np.nan),
+            "polymer_contact_fraction_std": agg.get("polymer_contact_fraction_std", np.nan),
+            "polymer_min_distance_nm": agg.get("polymer_min_distance_nm_mean", np.nan),
+            "polymer_n_core_beads_in": agg.get("polymer_n_core_beads_in_mean", np.nan),
+            "polymer_n_core_beads_in_std": agg.get("polymer_n_core_beads_in_std", np.nan),
+            "polymer_n_core_beads_total": agg.get("polymer_n_core_beads_total_mean", np.nan),
+
+            "condensate_bounds_extended": bool(extended[s]),
+            "condensate_detected_axes": ",".join(detected_axes[s]) if detected_axes[s] else "",
+            "condensate_detected_all_axes": len(detected_axes[s]) == 3,
+
+            "grid_nx": field_data["grid_shape"][0],
+            "grid_ny": field_data["grid_shape"][1],
+            "grid_nz": field_data["grid_shape"][2],
+            "voxel_volume_nm3": voxel_volume,
+            "field_sigma_nm": field_data["sigma_nm"],
+
+            "n_bins": n_bins,
+            "top_percentage": top_percentage,
+            "last_frames": last_frames if last_frames is not None else np.nan,
+            "frames_used": len(frame_indices),
+            "recentered": bool(recenter),
+            "recentered_per_species": bool(recenter_per_species),
+            "refined": bool(s in refined_species),
+            "shared_region": bool(shared_region),
+            "smooth_window": smooth_window,
+            "min_contrast": min_contrast,
+            "max_width_fraction": max_width_fraction,
+        }
+
+        # Per-axis columns describe the figure frame; their per-frame values are
+        # in the frames CSV.
+        for axis in axes:
+            name = DENSITY3D_AXIS_NAMES[axis]
+            res = axis_results[s][axis]
+            record[f"{name}_in_min"] = bounds[s][axis][0]
+            record[f"{name}_in_max"] = bounds[s][axis][1]
+            record[f"{name}_binseg_min"] = binseg_bounds[s][axis][0]
+            record[f"{name}_binseg_max"] = binseg_bounds[s][axis][1]
+            record[f"{name}_buffer_min"] = regions[stats["region_key"]]["buffered"][axis][0]
+            record[f"{name}_buffer_max"] = regions[stats["region_key"]]["buffered"][axis][1]
+            record[f"{name}_box_left"] = -float(box_lengths[axis]) / 2.0
+            record[f"{name}_box_right"] = float(box_lengths[axis]) / 2.0
+            record[f"{name}_transition_buffer_nm"] = buffers[axis]
+            record[f"{name}_detected"] = bool(res["detected"])
+            record[f"{name}_detection_note"] = res["reason"]
+            record[f"{name}_contrast"] = res["contrast"]
+            record[f"{name}_width_fraction"] = res["width_fraction"]
+            record[f"{name}_projected_dense_vf"] = res["high_vf"]
+            record[f"{name}_projected_dilute_vf"] = res["low_vf"]
+
+        # Per-chain polymer columns, mean and std, after the combined ones.
+        if polymer_chains:
+            record["n_polymer_chains"] = len(polymer_chains)
+        for k, chain in enumerate(polymer_chains, start=1):
+            record[f"polymer{k}_label"] = chain["label"]
+            for name in POLYMER_CHAIN_COLUMNS:
+                record[f"polymer{k}_{name}"] = agg.get(f"polymer{k}_{name}_mean", np.nan)
+                record[f"polymer{k}_{name}_std"] = agg.get(f"polymer{k}_{name}_std", np.nan)
+
+        summary_path = os.path.join(output_dir, f"{trajname}_{tag}_density3d_summary.csv")
+        add_hoomd_unit_metadata(
+            pd.DataFrame([record]), prepare_config=prepare_config
+        ).to_csv(summary_path, index=False)
+        summary_records.append(record)
+
+        print(
+            f"  {s}:{type_names[s]} -> dense VF = {record['high_vf']:.4g} "
+            f"+/- {record['high_vf_std']:.2g}, dilute VF = {record['low_vf']:.4g} "
+            f"+/- {record['low_vf_std']:.2g} "
+            f"({n_detected}/{len(frame_indices)} frames detected), "
+            f"threshold = {record['field_threshold_vf']:.4g} "
+            f"+/- {record['field_threshold_vf_std']:.2g}, "
+            f"isosurface volume = {record['condensate_volume_isosurface_nm3']:.1f} "
+            f"+/- {record['condensate_volume_isosurface_nm3_std']:.1f} nm^3"
+        )
+
+    summary_df = add_hoomd_unit_metadata(
+        pd.DataFrame(summary_records), prepare_config=prepare_config
+    )
+
+    if save_field:
+        for s in output_species_ids:
+            tag = species_tag(s, type_names[s])
+            npz_path = os.path.join(output_dir, f"{trajname}_{tag}_density3d_field.npz")
+            np.savez_compressed(
+                npz_path,
+                field=field_data["per_species"][s],
+                total_field=total_field,
+                x=field_data["centers"][0],
+                y=field_data["centers"][1],
+                z=field_data["centers"][2],
+                threshold=np.array([thresholds[s]]),
+                bounds=np.array([bounds[s][a] for a in axes]),
+                frame=np.array([plot_index]),
+            )
+            print(f"Saved raw field of frame {plot_index}: {npz_path}")
+
+    # --- Figures -----------------------------------------------------------
+    if plot:
+        frame_label = (
+            f"frame {field_indices[0]}" if len(field_indices) == 1
+            else f"mean of frames {field_indices[0]}-{field_indices[-1]}"
+        )
+
+        plot_axis_profiles_3d(
+            profiles, axis_results,
+            species_ids=output_species_ids, type_names=type_names,
+            output_dir=output_dir,
+            basename=f"{trajname}_all_species_density3d_profiles",
+            title=(
+                f"{trajname} density profiles along each axis, core species "
+                f"(shading: reference {reference_species}:{type_names[reference_species]})"
+            ),
+            bounds=bounds, binseg_bounds=binseg_bounds,
+            shade_species=reference_species,
+            prepare_config=prepare_config,
+        )
+
+        for s in output_species_ids:
+            tag = species_tag(s, type_names[s])
+
+            plot_axis_profiles_3d(
+                profiles, axis_results,
+                species_ids=[s], type_names=type_names,
+                output_dir=output_dir,
+                basename=f"{trajname}_{tag}_density3d_profiles",
+                title=f"{trajname} {s}:{type_names[s]} density profiles along each axis",
+                thresholds={s: thresholds[s]},
+                bounds=bounds, binseg_bounds=binseg_bounds, shade_species=s,
+                prepare_config=prepare_config,
+            )
+
+            if not plot_state["region_ok"][s] and not plot_all_species:
+                print(
+                    f"  3D field figures skipped for {s}:{type_names[s]} "
+                    "(condensate not detected on the required axes detected; use --density3d-plot-all-species to force)."
+                )
+                continue
+
+            # In per-species mode the region was found in that species' own frame,
+            # while the field lives in the reference frame, so drawing the cuboid
+            # here would put it in the wrong place.
+            display_bounds = (
+                None if (recenter_per_species and s != reference_species) else bounds[s]
+            )
+
+            # The fixed polymer's beads, in the same recentered coordinates as
+            # the field, so a chain that is not where you expect is visible.
+            polymer_points = None
+            if mark_polymer and plot_state.get("polymer") is not None:
+                if plot_state["polymer"]["polymer_present"]:
+                    polymer_points = plot_state["polymer"]["bead_positions"]
+
+            plot_concentration_field_3d(
+                field_data["per_species"][s], field_data["centers"],
+                threshold=thresholds[s], bounds=display_bounds, box_lengths=box_lengths,
+                output_dir=output_dir,
+                basename=f"{trajname}_{tag}_density3d_field",
+                title=f"{trajname} {s}:{type_names[s]} 3D concentration field ({frame_label})",
+                views=views if views else DENSITY3D_DEFAULT_VIEWS,
+                polymer_points=polymer_points,
+                max_points=max_points, marker_size=marker_size,
+                figure_format=figure_format, rotate_gif=rotate_gif,
+                interactive=interactive,
+            )
+
+            iso = plot_state["size_quant"][s]
+            if plot_isosurface_3d:
+                plot_filled_isosurface_3d(
+                    iso.get("mask"), field_data["centers"],
+                    raw_mask=iso.get("mask_raw"),
+                    box_lengths=box_lengths,
+                    output_dir=output_dir,
+                    basename=f"{trajname}_{tag}_density3d_isosurface",
+                    title=(
+                        f"{trajname} {s}:{type_names[s]} filled isosurface ({frame_label})\n"
+                        f"V = {iso['volume_nm3']:.4g} nm^3, of which filled holes "
+                        f"{iso['hole_volume_nm3']:.3g} nm^3"
+                    ),
+                    views=views if views else DENSITY3D_DEFAULT_VIEWS,
+                    polymer_points=polymer_points,
+                    figure_format=figure_format,
+                )
+
+            if make_slices:
+                polymer_xy = None
+                if mark_polymer and plot_state.get("polymer_per_chain"):
+                    polymer_xy = [
+                        (pol["x_nm"], pol["y_nm"])
+                        for _, pol in plot_state["polymer_per_chain"]
+                        if pol["polymer_present"]
+                    ] or None
+                elif mark_polymer and plot_state.get("polymer") is not None:
+                    pol = plot_state["polymer"]
+                    if pol["polymer_present"]:
+                        polymer_xy = (pol["x_nm"], pol["y_nm"])
+                plot_concentration_slices(
+                    field_data["per_species"][s], field_data["centers"],
+                    threshold=thresholds[s], bounds=display_bounds,
+                    output_dir=output_dir,
+                    basename=f"{trajname}_{tag}_density3d_slices",
+                    title=(
+                        f"{trajname} {s}:{type_names[s]} concentration slices "
+                        f"through the condensate center ({frame_label})"
+                    ),
+                    polymer_xy=polymer_xy, polymer_points=polymer_points,
+                    figure_format=figure_format,
+                )
+
+        # --- Two-color comparisons for pairs of core species ----------------
+        if two_color:
+            comparable = [
+                s for s in core_species
+                if plot_state["region_ok"][s] or plot_all_species
+            ]
+
+            if len(comparable) < 2:
+                if len(core_species) >= 2:
+                    print(
+                        "Two-color plots skipped: fewer than two core species have their own "
+                        "condensate (use --density3d-plot-all-species to force)."
+                    )
+            else:
+                pairs = []
+                for i in range(len(comparable)):
+                    for j in range(i + 1, len(comparable)):
+                        pairs.append((comparable[i], comparable[j]))
+
+                if len(pairs) > int(max_two_color_pairs):
+                    print(
+                        f"Two-color plots: {len(pairs)} pairs available, rendering the first "
+                        f"{int(max_two_color_pairs)}."
+                    )
+                    pairs = pairs[: int(max_two_color_pairs)]
+
+                for a, b in pairs:
+                    tag_a = species_tag(a, type_names[a])
+                    tag_b = species_tag(b, type_names[b])
+                    entries = [
+                        {
+                            "field": field_data["per_species"][a],
+                            "threshold": thresholds[a],
+                            "bounds": None if recenter_per_species else bounds[a],
+                            "label": f"{a}: {type_names[a]}",
+                            "color": DENSITY3D_SPECIES_COLORS[0],
+                        },
+                        {
+                            "field": field_data["per_species"][b],
+                            "threshold": thresholds[b],
+                            "bounds": None if recenter_per_species else bounds[b],
+                            "label": f"{b}: {type_names[b]}",
+                            "color": DENSITY3D_SPECIES_COLORS[1],
+                        },
+                    ]
+
+                    plot_two_color_field_3d(
+                        entries, field_data["centers"],
+                        box_lengths=box_lengths,
+                        output_dir=output_dir,
+                        basename=f"{trajname}_{tag_a}_vs_{tag_b}_density3d_field_2color",
+                        title=(
+                            f"{trajname} 3D concentration field, "
+                            f"{type_names[a]} vs {type_names[b]} ({frame_label})"
+                        ),
+                        views=views if views else DENSITY3D_DEFAULT_VIEWS,
+                        max_points=max_points, marker_size=marker_size,
+                        figure_format=figure_format, rotate_gif=rotate_gif,
+                        interactive=interactive,
+                    )
+
+                    if make_slices:
+                        plot_two_color_slices(
+                            entries, field_data["centers"],
+                            output_dir=output_dir,
+                            basename=f"{trajname}_{tag_a}_vs_{tag_b}_density3d_slices_2color",
+                            title=(
+                                f"{trajname} concentration slices, "
+                                f"{type_names[a]} vs {type_names[b]} ({frame_label})"
+                            ),
+                            figure_format=figure_format,
+                        )
+
+    return profiles_by_species, summary_df
+
+
+def parse_view_specs(specs):
+    """Parse --density3d-views entries of the form 'elev,azim'."""
+    if not specs:
+        return list(DENSITY3D_DEFAULT_VIEWS)
+
+    views = []
+    for spec in specs:
+        parts = str(spec).replace(":", ",").split(",")
+        if len(parts) != 2:
+            warnings.warn(f"Ignoring malformed view spec '{spec}'; expected 'elev,azim'.")
+            continue
+        try:
+            views.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            warnings.warn(f"Ignoring malformed view spec '{spec}'; expected numbers.")
+    return views or list(DENSITY3D_DEFAULT_VIEWS)
+
+
+# =================================================================================
+# 3D droplet detection (periodic-aware) and inside/outside density; LUCA'S VERSION
+# =================================================================================
+
+
+def _periodic_label_3d(mask: np.ndarray) -> np.ndarray:
+    """
+    Label connected components of a 3D boolean mask under full periodic
+    boundary conditions on all three axes.
+
+    Implementation: tile the mask 3x3x3 (one periodic copy in every
+    direction), label connected components on the tiled array with standard
+    (non-periodic) 26-connectivity, then read off the labels for the
+    CENTRAL copy. This correctly reproduces periodic connectivity as long
+    as no single connected component wraps around the box more than once
+    along any axis -- true for any physically compact droplet, including
+    one that straddles a single periodic boundary (as in your rendering).
+    """
+    from scipy.ndimage import label
+
+    nx, ny, nz = mask.shape
+    tiled = np.tile(mask, (3, 3, 3))
+    structure = np.ones((3, 3, 3), dtype=int)  # full 26-connectivity
+    tiled_labels, _ = label(tiled, structure=structure)
+
+    return tiled_labels[nx:2 * nx, ny:2 * ny, nz:2 * nz]
+
+
+def _periodic_center_of_mass_1d(coord: np.ndarray, L: float) -> float:
+    """
+    Circular-mean estimate of a periodic center of mass along one axis.
+    A plain arithmetic mean is meaningless for a cluster straddling a
+    periodic boundary -- this maps coordinates onto a circle, averages the
+    resulting unit vectors, then maps the mean angle back to a coordinate.
+    """
+    theta = 2.0 * np.pi * (coord / L)
+    mean_theta = np.arctan2(np.mean(np.sin(theta)), np.mean(np.cos(theta)))
+    return float(L * mean_theta / (2.0 * np.pi))
+
+
+def _collect_density_grid_arrays(traj, species_ids, n_bins):
+    """
+    Build a 3D histogram of particle counts for selected species over the last frame. Bin edges match the LAST frame's box.
+    Could add "start = max(0, int(round(n_frames * (1.0 - top_percentage))))" and "frame_indices = range(start, n_frames) or range(n_frames - 1, n_frames)"
+    for averaging over the last fraction of frames.
+    """
+    species_ids = [int(s) for s in species_ids]
+
+    last = traj[len(traj) - 1]
+    Lx, Ly, Lz = np.asarray(last.configuration.box[:3], dtype=float)
+    edges = [
+        np.linspace(-Lx / 2, Lx / 2, n_bins + 1),
+        np.linspace(-Ly / 2, Ly / 2, n_bins + 1),
+        np.linspace(-Lz / 2, Lz / 2, n_bins + 1),
+    ]
+    voxel_volume = (Lx / n_bins) * (Ly / n_bins) * (Lz / n_bins)
+
+    n_frames = len(traj)
+    frame_indices = range(n_frames - 1, n_frames)
+
+    count_sum = np.zeros((n_bins, n_bins, n_bins), dtype=float)
+    n_used = 0
+
+    for i in tqdm(frame_indices, desc="Droplet density grid", leave=False):
+        frame = traj[i]
+        typeids = np.asarray(frame.particles.typeid, dtype=int)
+        mask = np.isin(typeids, species_ids)
+        pos = np.asarray(frame.particles.position, dtype=float)[mask]
+        if pos.shape[0] == 0:
+            continue
+
+        hist, _ = np.histogramdd(pos, bins=edges)
+        count_sum += hist
+        n_used += 1
+
+    if n_used == 0:
+        return None
+
+    return {
+        "mean_counts": count_sum / n_used,
+        "voxel_volume": voxel_volume,
+        "edges": edges,
+        "box_lengths": (Lx, Ly, Lz),
+        "n_frames_used": n_used,
+    }
+
+
+def default_polymer_typeids(frame) -> list[int]:
+    """
+    Heuristic detection of polymer-associated particle types, matching
+    type names containing 'poly' (case-insensitive) -- covers naming
+    conventions like 'PolyCore', 'Poly2PPA_core', 'RegPolyCore', etc.
+    Returns an empty list if nothing matches; pass polymer_species_ids
+    explicitly (e.g. name_to_typeid(frame, "TetherBead")) if your naming
+    convention differs.
+    """
+    names = get_type_names(frame)
+    return [i for i, name in enumerate(names) if "poly" in name.lower()]
+
+
+def _voxel_roll_shifts(centers, target_point, n_bins, L):
+    """
+    For each axis, the integer number of voxel positions to roll a
+    density/mask array so the voxel nearest target_point[axis] lands on
+    the array's middle index. Used to recenter a droplet that straddles a
+    periodic box face so it renders as one contiguous blob.
+    """
+    shifts = []
+    for axis_centers, t, Lc in zip(centers, target_point, L):
+        idx = int(np.argmin(np.abs(((axis_centers - t + Lc / 2) % Lc) - Lc / 2)))
+        shifts.append(n_bins // 2 - idx)
+    return tuple(shifts)
+
+
+def _periodic_recenter_points(points, center, L):
+    """
+    Shift `points` (N, 3) so `center` maps to the origin, wrapping every
+    axis into [-L_axis/2, L_axis/2). Keeps the polymer/particle overlay in
+    the same recentered frame as the rolled density grid.
+    """
+    points = np.asarray(points, dtype=float)
+    center = np.asarray(center, dtype=float)
+    L = np.asarray(L, dtype=float)
+    shifted = points - center
+    return ((shifted + L / 2.0) % L) - L / 2.0
+
+
+def _extract_surface_mesh(mask, edges):
+    """
+    Triangulated isosurface of a boolean voxel mask at the 0.5 level, in
+    physical coordinates matching `edges`. Requires scikit-image; returns
+    None if unavailable so the caller can fall back to a boundary-voxel
+    point cloud instead.
+    """
+    try:
+        from skimage.measure import marching_cubes
+    except ImportError:
+        return None
+
+    centers = [0.5 * (e[:-1] + e[1:]) for e in edges]
+    spacing = tuple(float(c[1] - c[0]) for c in centers)
+    origin = np.array([c[0] for c in centers], dtype=float)
+
+    verts, faces, _, _ = marching_cubes(mask.astype(float), level=0.5, spacing=spacing)
+    verts = verts + origin  # array-index space -> physical coordinates
+    return verts, faces
+
+
+def _boundary_voxel_centers(mask, edges):
+    """
+    Fallback surface representation when scikit-image is unavailable:
+    physical coordinates of dense voxels adjacent to at least one
+    non-dense voxel, found via periodic (wrap-padded) binary erosion.
+    """
+    from scipy.ndimage import binary_erosion
+
+    padded = np.pad(mask, pad_width=1, mode="wrap")
+    eroded_padded = binary_erosion(padded, structure=np.ones((3, 3, 3)))
+    eroded = eroded_padded[1:-1, 1:-1, 1:-1]
+    boundary = mask & ~eroded
+
+    centers = [0.5 * (e[:-1] + e[1:]) for e in edges]
+    xx, yy, zz = np.meshgrid(*centers, indexing="ij")
+    return xx[boundary], yy[boundary], zz[boundary]
+
+
+def _recentered_voxel_edges(centers, target_point, L, n_bins):
+    """
+    Build per-axis bin-edge arrays for the voxel grid AFTER it has been
+    rolled (via _voxel_roll_shifts) so the droplet's nearest voxel sits at
+    index n_bins//2 -- consistent with the explicit position recentering
+    done by _periodic_recenter_points for real particles.
+
+    Simply reusing the original (unshifted) `edges`/`centers` after rolling
+    the array data is WRONG: index n_bins//2 of the rolled array holds data
+    from an arbitrary original box location, not necessarily near
+    coordinate 0, so mesh/boundary surfaces built that way are mislabeled
+    relative to recentered particle positions by up to spacing/2 per axis.
+    This function instead constructs a locally linear, wrap-corrected
+    coordinate axis so index n_bins//2 maps to (approximately) 0.
+    """
+    new_edges = []
+    for axis_centers, t, Lc in zip(centers, target_point, L):
+        spacing = float(axis_centers[1] - axis_centers[0])
+        idx = int(np.argmin(np.abs(((axis_centers - t + Lc / 2) % Lc) - Lc / 2)))
+        residual = float(axis_centers[idx] - t)  # |residual| <= spacing/2
+
+        local_centers = (np.arange(n_bins) - n_bins // 2) * spacing + residual
+        local_edges = np.concatenate(
+            [local_centers - spacing / 2, [local_centers[-1] + spacing / 2]]
+        )
+        new_edges.append(local_edges)
+    return new_edges
+
+
+def detect_droplet_3d(
+    traj_file,
+    species_ids=None,
+    polymer_species_ids=None,
+    n_bins=40,
+    smooth_sigma=1.5,
+    min_droplet_voxel_fraction=0.001,
+    output_dir=".",
+    plot=False,
+    prepare_config=None,
+):
+    """
+    Detect a single dense droplet in a periodic 3D box and report its
+    approximate volume, center, and mean number density inside vs outside
+    it. See module comments above for the full method description.
+
+    n_bins: voxels per axis. Pick this so each voxel is a few particle
+    diameters across -- too fine and voxel counts are dominated by
+    shot noise; too coarse and the droplet boundary is poorly resolved.
+
+    smooth_sigma: Gaussian smoothing width, in VOXELS (not physical
+    units), applied before thresholding only -- reported densities use the
+    unsmoothed counts.
+
+    species_ids: defaults to all "core"-classified types (via
+    classify_type_name/default_core_typeids). If your system also has a
+    polymer whose core type name ends in "_core" (e.g. from a
+    RegPolyCore-based template), that polymer's beads will be included
+    under this default too. Pass an explicit species_ids (e.g. just the
+    patchy-particle core typeid) if you want the polymer excluded from the
+    droplet's own density calculation.
+    """
+    from scipy.ndimage import gaussian_filter
+    from scipy.cluster.vq import kmeans2
+
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+
+    with open_traj(traj_file) as traj:
+        last = traj[len(traj) - 1]
+        if species_ids is None:
+            species_ids = [name_to_typeid(last, "3PPB_core")]
+
+        if polymer_species_ids is None:
+            try:
+                polymer_species_ids = [name_to_typeid(last, "FixedChain")]
+            except ValueError:
+                polymer_species_ids = None
+
+        arrays = _collect_density_grid_arrays(traj, species_ids, n_bins)
+
+        typeids_last = np.asarray(last.particles.typeid, dtype=int)
+        positions_last = np.asarray(last.particles.position, dtype=float)
+        core_mask_last = np.isin(typeids_last, species_ids)
+        core_positions_last = positions_last[core_mask_last] if np.any(core_mask_last) else None
+
+        polymer_positions = None
+        polymer_tags = None
+        if polymer_species_ids:
+            poly_mask = np.isin(typeids_last, polymer_species_ids)
+            if np.any(poly_mask):
+                all_tags = np.arange(len(typeids_last))
+                polymer_tags = all_tags[poly_mask]
+                polymer_positions = positions_last[poly_mask]
+
+                assert np.all(np.diff(polymer_tags) > 0), (
+                "polymer_tags is not strictly ascending; chain connectivity "
+                "order can no longer be inferred from tag order."
+                )
+
+    if arrays is None:
+        print("Skipping droplet detection: no particles of the requested species found.")
+        return None
+
+    mean_counts = arrays["mean_counts"]
+    voxel_volume = arrays["voxel_volume"]
+    Lx, Ly, Lz = arrays["box_lengths"]
+    box_volume = Lx * Ly * Lz
+
+    raw_density = mean_counts / voxel_volume
+    smoothed_density = gaussian_filter(raw_density, sigma=smooth_sigma, mode="wrap")
+
+    flat = smoothed_density.reshape(-1, 1)
+    centroids, labels = kmeans2(flat, k=2, seed=0, minit="++")
+    dense_cluster_id = int(np.argmax(centroids[:, 0]))
+    dense_mask = (labels == dense_cluster_id).reshape(smoothed_density.shape)
+
+    component_labels = _periodic_label_3d(dense_mask)
+    unique_labels, counts = np.unique(component_labels, return_counts=True)
+    nonzero = unique_labels != 0
+    if not np.any(nonzero):
+        print("Skipping droplet detection: no dense region found after thresholding.")
+        return None
+
+    unique_labels, counts = unique_labels[nonzero], counts[nonzero]
+    min_voxels = max(1, int(round(min_droplet_voxel_fraction * mean_counts.size)))
+    keep = counts >= min_voxels
+    if not np.any(keep):
+        print(
+            f"Skipping droplet detection: largest dense component "
+            f"({int(counts.max())} voxels) is below the minimum threshold "
+            f"({min_voxels} voxels)."
+        )
+        return None
+
+    largest_label = unique_labels[keep][np.argmax(counts[keep])]
+    droplet_mask = component_labels == largest_label
+
+    droplet_voxel_count = int(np.sum(droplet_mask))
+    droplet_volume = droplet_voxel_count * voxel_volume
+    droplet_particle_count = float(np.sum(mean_counts[droplet_mask]))
+    droplet_density = droplet_particle_count / droplet_volume if droplet_volume > 0 else np.nan
+
+    outside_volume = box_volume - droplet_volume
+    outside_particle_count = float(np.sum(mean_counts[~droplet_mask]))
+    outside_density = outside_particle_count / outside_volume if outside_volume > 0 else np.nan
+
+    edges = arrays["edges"]
+    centers = [0.5 * (e[:-1] + e[1:]) for e in edges]
+    xx, yy, zz = np.meshgrid(*centers, indexing="ij")
+    droplet_center = (
+        _periodic_center_of_mass_1d(xx[droplet_mask], Lx),
+        _periodic_center_of_mass_1d(yy[droplet_mask], Ly),
+        _periodic_center_of_mass_1d(zz[droplet_mask], Lz),
+    )
+
+    result = {
+        "trajname": trajname,
+        "species_ids": list(species_ids),
+        "n_bins": n_bins,
+        "n_frames_used": arrays["n_frames_used"],
+        "voxel_volume": voxel_volume,
+        "box_lengths": (Lx, Ly, Lz),
+        "box_volume": box_volume,
+        "droplet_voxel_count": droplet_voxel_count,
+        "droplet_volume": droplet_volume,
+        "droplet_particle_count": droplet_particle_count,
+        "droplet_density": droplet_density,
+        "droplet_center": droplet_center,
+        "outside_volume": outside_volume,
+        "outside_particle_count": outside_particle_count,
+        "outside_density": outside_density,
+        "total_particle_count": float(np.sum(mean_counts)),
+        "dense_mask": droplet_mask,
+        "smoothed_density_grid": smoothed_density,
+        "raw_density_grid": raw_density,
+        "edges": edges,
+    }
+
+    summary_df = pd.DataFrame([{
+        "trajname": trajname,
+        "n_frames_used": result["n_frames_used"],
+        "n_bins": n_bins,
+        "droplet_volume": droplet_volume,
+        "droplet_density": droplet_density,
+        "droplet_particle_count": droplet_particle_count,
+        "outside_volume": outside_volume,
+        "outside_density": outside_density,
+        "outside_particle_count": outside_particle_count,
+        "box_volume": box_volume,
+        "droplet_center_x": droplet_center[0],
+        "droplet_center_y": droplet_center[1],
+        "droplet_center_z": droplet_center[2],
+    }])
+    summary_df = add_hoomd_unit_metadata(summary_df, dt=None, prepare_config=prepare_config)
+    summary_df.to_csv(os.path.join(output_dir, f"{trajname}_droplet_3d_summary.csv"), index=False)
+
+    print(
+        f"Droplet detected: {droplet_voxel_count} voxels, "
+        f"volume={droplet_volume:.4g} {unit_label('volume', prepare_config)}, "
+        f"density_in={droplet_density:.4g}, density_out={outside_density:.4g} "
+        f"[particles / {unit_label('volume', prepare_config)}]"
+    )
+
+    if plot:
+        _plot_droplet_3d_interactive(result, output_dir, prepare_config=prepare_config, polymer_positions=polymer_positions, core_positions=core_positions_last)
+
+    return result
+
+
+def _plot_droplet_slices(result, output_dir, prepare_config=None):
+    """
+    Save three orthogonal mid-plane slices of the smoothed density field,
+    with the detected droplet boundary overlaid as a contour. A quick
+    visual sanity check for the segmentation, not a full 3D rendering.
+    """
+    trajname = result["trajname"]
+    density = result["smoothed_density_grid"]
+    mask = result["dense_mask"].astype(float)
+    mid = density.shape[0] // 2
+
+    slices = [
+        ("x_mid", density[mid, :, :], mask[mid, :, :], "y", "z"),
+        ("y_mid", density[:, mid, :], mask[:, mid, :], "x", "z"),
+        ("z_mid", density[:, :, mid], mask[:, :, mid], "x", "y"),
+    ]
+
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
+    for ax, (name, dens_slice, mask_slice, xlabel, ylabel) in zip(axs, slices):
+        im = ax.imshow(dens_slice.T, origin="lower", cmap="viridis", aspect="auto")
+        ax.contour(mask_slice.T, levels=[0.5], colors="white", linewidths=1.5)
+        ax.set_title(f"{name} slice")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        fig.colorbar(im, ax=ax, label=f"density [1/{unit_label('volume', prepare_config)}]")
+
+    fig.suptitle(f"{trajname}: droplet detection (mid-plane slices)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"{trajname}_droplet_3d_slices.svg"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_droplet_3d(
+    result,
+    output_dir,
+    prepare_config=None,
+    polymer_positions=None,
+    core_positions=None,
+):
+    """
+    3D visualization of the detected droplet boundary as a surface, with
+    the polymer (if provided) overlaid as a connected line. The whole
+    scene is recentered on the droplet's periodic center of mass, so a
+    droplet split across a periodic box face renders as a single contiguous
+    region instead of two disconnected pieces at opposite box edges.
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d projection)
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    trajname = result["trajname"]
+    edges = result["edges"]
+    Lx, Ly, Lz = result["box_lengths"]
+    L = np.array([Lx, Ly, Lz])
+    droplet_center = np.array(result["droplet_center"])
+    mask = result["dense_mask"]
+    n_bins = result["n_bins"]
+
+    centers = [0.5 * (e[:-1] + e[1:]) for e in edges]
+    roll_shifts = _voxel_roll_shifts(centers, droplet_center, n_bins, L)
+    mask_rolled = np.roll(mask, shift=roll_shifts, axis=(0, 1, 2))
+
+    fig = plt.figure(figsize=(11, 11), dpi=200)
+    ax = fig.add_subplot(111, projection="3d")
+
+    mesh = _extract_surface_mesh(mask_rolled, edges)
+    if mesh is not None:
+        verts, faces = mesh
+        poly = Poly3DCollection(
+            verts[faces], alpha=0.35, facecolor="darkorange", edgecolor="none"
+        )
+        ax.add_collection3d(poly)
+    else:
+        bx, by, bz = _boundary_voxel_centers(mask_rolled, edges)
+        ax.scatter(bx, by, bz, s=4, color="darkorange", alpha=0.4, label="droplet boundary")
+
+    if core_positions is not None and len(core_positions) > 0:
+        core_recentered = _periodic_recenter_points(core_positions, droplet_center, L)
+        ax.scatter(
+            core_recentered[:, 0], core_recentered[:, 1], core_recentered[:, 2],
+            s=6, color="mediumblue", alpha=0.35, linewidths=0, label="3PPB cores (last frame)",
+        )
+
+    if polymer_positions is not None and len(polymer_positions) > 0:
+        poly_recentered = _periodic_recenter_points(polymer_positions, droplet_center, L)
+        # Sort by z for a clean connecting line -- reasonable for a
+        # roughly-straight, z-tethered polymer. If your polymer isn't
+        # z-oriented, points still plot correctly, just without a
+        # meaningful line ordering.
+        # order = np.argsort(poly_recentered[:, 2])
+        ax.plot(
+            poly_recentered[:, 0], poly_recentered[:, 1], poly_recentered[:, 2],
+            color="cyan", linewidth=2.5, marker="o", markersize=6, label="polymer",
+        )
+
+    ax.set_xlim(-Lx / 2, Lx / 2)
+    ax.set_ylim(-Ly / 2, Ly / 2)
+    ax.set_zlim(-Lz / 2, Lz / 2)
+    ax.set_xlabel(f"x [{unit_label('length', prepare_config)}]")
+    ax.set_ylabel(f"y [{unit_label('length', prepare_config)}]")
+    ax.set_zlabel(f"z [{unit_label('length', prepare_config)}]")
+    ax.set_title(f"{trajname}: detected droplet (recentered) + polymer")
+    ax.legend(loc="upper right", fontsize=8, markerscale=2)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"{trajname}_droplet_3d.svg"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_droplet_3d_interactive(
+    result,
+    output_dir,
+    prepare_config=None,
+    polymer_positions=None,
+    core_positions=None,
+):
+    """
+    3D visualization of the detected droplet boundary as a surface, with
+    the polymer (if provided) overlaid as a connected line. The whole
+    scene is recentered on the droplet's periodic center of mass, so a
+    droplet split across a periodic box face renders as a single contiguous
+    region instead of two disconnected pieces at opposite box edges.
+    """
+    import plotly.graph_objects as go
+
+    trajname = result["trajname"]
+    edges = result["edges"]
+    Lx, Ly, Lz = result["box_lengths"]
+    L = np.array([Lx, Ly, Lz])
+    droplet_center = np.array(result["droplet_center"])
+    mask = result["dense_mask"]
+    n_bins = result["n_bins"]
+
+    centers = [0.5 * (e[:-1] + e[1:]) for e in edges]
+    roll_shifts = _voxel_roll_shifts(centers, droplet_center, n_bins, L)
+    mask_rolled = np.roll(mask, shift=roll_shifts, axis=(0, 1, 2))
+
+    recentered_edges = _recentered_voxel_edges(centers, droplet_center, L, n_bins)
+
+    length_unit = unit_label("length", prepare_config)
+    traces = []
+
+    mesh = _extract_surface_mesh(mask_rolled, recentered_edges)
+    if mesh is not None:
+        verts, faces = mesh
+        traces.append(
+            go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                color="darkorange", opacity=0.25, name="droplet boundary",
+                showlegend=True, hoverinfo="skip",
+            )
+        )
+    else:
+        bx, by, bz = _boundary_voxel_centers(mask_rolled, recentered_edges)
+        traces.append(
+            go.Scatter3d(
+                x=bx, y=by, z=bz, mode="markers",
+                marker=dict(size=2, color="darkorange", opacity=0.3),
+                name="droplet boundary",
+            )
+        )
+
+    if core_positions is not None and len(core_positions) > 0:
+        core_recentered = _periodic_recenter_points(core_positions, droplet_center, L)
+        traces.append(
+            go.Scatter3d(
+                x=core_recentered[:, 0], y=core_recentered[:, 1], z=core_recentered[:, 2],
+                mode="markers",
+                marker=dict(size=2, color="mediumblue", opacity=0.4),
+                name="3PPB cores (last frame)",
+            )
+        )
+
+    if polymer_positions is not None and len(polymer_positions) > 0:
+        poly_recentered = _periodic_recenter_points(polymer_positions, droplet_center, L)
+        traces.append(
+            go.Scatter3d(
+                x=poly_recentered[:, 0], y=poly_recentered[:, 1], z=poly_recentered[:, 2],
+                mode="lines+markers",
+                line=dict(color="cyan", width=6),
+                marker=dict(size=3, color="cyan"),
+                name="polymer",
+            )
+        )
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=f"{trajname}: detected droplet (recentered) + cores + polymer",
+        scene=dict(
+            xaxis=dict(title=f"x [{length_unit}]", range=[-Lx / 2, Lx / 2]),
+            yaxis=dict(title=f"y [{length_unit}]", range=[-Ly / 2, Ly / 2]),
+            zaxis=dict(title=f"z [{length_unit}]", range=[-Lz / 2, Lz / 2]),
+            aspectmode="data",  # keep true relative box proportions, not auto-stretched
+        ),
+        legend=dict(itemsizing="constant"),
+    )
+
+    html_path = os.path.join(output_dir, f"{trajname}_droplet_3d_interactive.html")
+    fig.write_html(html_path)
+    print(f"Wrote interactive droplet plot: {html_path}")
+
+
+# =============================================================================
+# Bonds
+# =============================================================================
+
+
+def compute_bond_statistics(
+    traj,
+    type_1,
+    type_2,
+    dist,
+    stepper=1,
+    tail_fraction=0.25,
+):
+    """
+    Compute proximity-based bond-count time series.
+
+    Bond definition:
+        distance(type_1, type_2) < dist
+
+    For type_1 == type_2, each pair is counted once.
+    """
+    if stepper < 1:
+        raise ValueError("stepper must be >= 1.")
+    if not (0 < tail_fraction <= 1):
+        raise ValueError("tail_fraction must satisfy 0 < tail_fraction <= 1.")
+
+    type_1 = int(type_1)
+    type_2 = int(type_2)
+
+    bond_counts = []
+    timesteps = []
+
+    frame_indices = range(0, len(traj), stepper)
+
+    for i in tqdm(frame_indices, desc="Finding bonds", leave=False):
+        frame = traj[i]
+
+        box = make_freud_box(frame)
+        typeids = np.asarray(frame.particles.typeid, dtype=int)
+        pos = np.asarray(frame.particles.position, dtype=float)
+
+        filter_A = typeids == type_1
+        filter_B = typeids == type_2
+
+        positions_A = pos[filter_A]
+        positions_B = pos[filter_B]
+
+        if len(positions_A) == 0 or len(positions_B) == 0:
+            bond_counts.append(0)
+            timesteps.append(frame.configuration.step)
+            continue
+
+        aq = freud.locality.AABBQuery(box, positions_A)
+
+        query_result = aq.query(
+            positions_B,
+            dict(
+                mode="ball",
+                r_max=float(dist),
+                exclude_ii=(type_1 == type_2),
+            ),
+        )
+
+        nlist = query_result.toNeighborList()
+
+        distances = np.asarray(nlist.distances)
+        within_cutoff = distances < dist
+
+        if type_1 == type_2:
+            query_indices = np.asarray(nlist.query_point_indices)
+            point_indices = np.asarray(nlist.point_indices)
+            unique_pair_mask = query_indices < point_indices
+            n_bonds = int(np.sum(within_cutoff & unique_pair_mask))
+        else:
+            n_bonds = int(np.sum(within_cutoff))
+
+        bond_counts.append(n_bonds)
+        timesteps.append(frame.configuration.step)
+
+    bond_counts = np.array(bond_counts, dtype=float)
+    timesteps = np.array(timesteps)
+
+    n_tail = max(1, int(len(bond_counts) * tail_fraction))
+    tail_bonds = bond_counts[-n_tail:]
+
+    mean_bonds_tail = float(np.mean(tail_bonds))
+    std_bonds_tail = float(np.std(tail_bonds))
+
+    first_frame = traj[0]
+    typeids0 = np.asarray(first_frame.particles.typeid, dtype=int)
+
+    n_type1 = int(np.sum(typeids0 == type_1))
+    n_type2 = int(np.sum(typeids0 == type_2))
+
+    # "Analyte" normalization: fraction = number of detected bonds divided by
+    # the total number of particles of the first requested type.  For
+    # patch-patch auto-analysis type_1 == type_2, this is simply the total
+    # number of analyte patch particles.
+    analyte_norm = max(n_type1, 1)
+    bonded_fraction = bond_counts / analyte_norm
+    tail_fraction_values = bonded_fraction[-n_tail:]
+
+    return {
+        "timesteps": timesteps,
+        "bond_counts": bond_counts,
+        "mean_bonds_tail": mean_bonds_tail,
+        "std_bonds_tail": std_bonds_tail,
+        "bonded_fraction": bonded_fraction,
+        "bonded_fraction_mean": float(np.mean(tail_fraction_values)),
+        "bonded_fraction_std": float(np.std(tail_fraction_values)),
+        "n_type1": n_type1,
+        "n_type2": n_type2,
+        "analyte_norm": analyte_norm,
+    }
+
+
+def auto_bond_parameter_list(frame, prepare_config=None):
+    """
+    Auto-detect patch-patch bond analyses.
+
+    If prepare.py is available, use the active populations/templates to choose
+    patch types and set cutoff = 2 * patch sigma. This matches the
+    requested bond-distance criterion for two interacting patches. If prepare.py is missing or the names do not match the trajectory,
+    fall back to patch-like type names in the GSD and use their GSD diameter.
+    """
+    names = get_type_names(frame)
+    name_to_id = {name: i for i, name in enumerate(names)}
+    diam_by_type = mean_diameter_by_type(frame)
+    pairs = []
+
+    for patch_name, bead_type in _population_active_patch_aliases(prepare_config):
+        if patch_name not in name_to_id:
+            # Some simulation versions use alias_PatchX, some may use just PatchX.
+            matches = [name for name in names if name.endswith("_" + bead_type) or name == bead_type]
+            if not matches:
+                continue
+            patch_name = matches[0]
+        tid = name_to_id[patch_name]
+        patch_sigma = patch_sigma_from_prepare(prepare_config, bead_type, fallback=diam_by_type.get(tid, np.nan))
+        if not np.isfinite(patch_sigma) or patch_sigma <= 0:
+            patch_sigma = diam_by_type.get(tid, 0.12)
+        cutoff = 2.0 * float(patch_sigma)
+        pairs.append((tid, tid, cutoff))
+
+    if pairs:
+        return unique_preserve_order(pairs)
+
+    patch_ids = default_patch_typeids(frame)
+    for tid in patch_ids:
+        pairs.append((tid, tid, 2.0 * float(diam_by_type.get(tid, 0.12))))
+
+    return unique_preserve_order(pairs)
+
+
+def auto_bond_parameters(frame, prepare_config=None):
+    pairs = auto_bond_parameter_list(frame, prepare_config=prepare_config)
+    return pairs[0] if pairs else None
+
+def analyze_bonds(
+    traj_file,
+    type_1=None,
+    type_2=None,
+    dist=None,
+    stepper=1,
+    tail_fraction=0.25,
+    output_dir=".",
+    plot=False,
+    auto_if_missing=True,
+    prepare_config=None,
+    dt=None,
+):
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+    dt_for_time = get_dt_from_prepare(prepare_config) if dt is None else float(dt)
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+
+        if type_1 is None or type_2 is None or dist is None:
+            if not auto_if_missing:
+                print("Skipping bonds: bond parameters not provided.")
+                return None, None
+
+            auto_pairs = auto_bond_parameter_list(first, prepare_config=prepare_config)
+            if not auto_pairs:
+                print("Skipping bonds: no patch types found for automatic bond analysis.")
+                return None, None
+        else:
+            auto_pairs = [(type_1, type_2, dist)]
+
+        all_timeseries = []
+        all_summaries = []
+
+        for type_1, type_2, dist in auto_pairs:
+            print(
+                f"Bond parameters: type_1={type_1} ({typeid_to_name(first, type_1)}), "
+                f"type_2={type_2} ({typeid_to_name(first, type_2)}), dist={dist:.6g} {unit_label("length", prepare_config)}"
+            )
+
+            stats = compute_bond_statistics(
+                traj=traj,
+                type_1=type_1,
+                type_2=type_2,
+                dist=dist,
+                stepper=stepper,
+                tail_fraction=tail_fraction,
+            )
+
+            type_1_name = typeid_to_name(first, int(type_1))
+            type_2_name = typeid_to_name(first, int(type_2))
+
+            timeseries_df = pd.DataFrame({
+                "step": stats["timesteps"],
+                "time_ps": timestep_to_hoomd_time(stats["timesteps"], dt_for_time),
+                "bond_count": stats["bond_counts"],
+                "bonded_fraction": stats["bonded_fraction"],
+                "trajname": trajname,
+                "kT_kJ_per_mol": kT,
+                "type_1": int(type_1),
+                "type_2": int(type_2),
+                "type_1_name": type_1_name,
+                "type_2_name": type_2_name,
+                "dist_nm": float(dist),
+            })
+            timeseries_df = add_hoomd_unit_metadata(timeseries_df, dt=dt_for_time, prepare_config=prepare_config)
+
+            summary_df = pd.DataFrame([{
+                "trajname": trajname,
+                "kT_kJ_per_mol": kT,
+                "type_1": int(type_1),
+                "type_2": int(type_2),
+                "type_1_name": type_1_name,
+                "type_2_name": type_2_name,
+                "dist_nm": float(dist),
+                "stepper": stepper,
+                "tail_fraction": tail_fraction,
+                "mean_bonds_tail": stats["mean_bonds_tail"],
+                "std_bonds_tail": stats["std_bonds_tail"],
+                "bonded_fraction_mean": stats["bonded_fraction_mean"],
+                "bonded_fraction_std": stats["bonded_fraction_std"],
+                "n_type1": stats["n_type1"],
+                "n_type2": stats["n_type2"],
+                "analyte_norm": stats["analyte_norm"],
+            }])
+            summary_df = add_hoomd_unit_metadata(summary_df, dt=dt_for_time, prepare_config=prepare_config)
+
+            pair_tag = f"type_{type_1}_type_{type_2}_dist_{safe_name(f'{float(dist):.6g}')}"
+            timeseries_csv = os.path.join(output_dir, f"{trajname}_bonds_{pair_tag}_timeseries.csv")
+            summary_csv = os.path.join(output_dir, f"{trajname}_bonds_{pair_tag}_summary.csv")
+
+            timeseries_df.to_csv(timeseries_csv, index=False)
+            summary_df.to_csv(summary_csv, index=False)
+
+            if plot:
+                fig, ax = plt.subplots(figsize=(9, 6), dpi=200)
+                ax.plot(timeseries_df["time_ps"], timeseries_df["bonded_fraction"], marker="o", ms=3, label="Bonded fraction")
+                avg_frac = stats["bonded_fraction_mean"]
+                std_frac = stats["bonded_fraction_std"]
+                if np.isfinite(avg_frac):
+                    ax.axhline(avg_frac, linestyle="--", linewidth=1.5, label=f"Last {tail_fraction:.0%} avg")
+                    ax.text(
+                        0.98,
+                        0.98,
+                        f"last {tail_fraction:.0%} avg = {avg_frac:.4g}\nstd = {std_frac:.3g}",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="top",
+                        fontsize=9,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+                    )
+                ax.set_xlabel(f"time [{unit_label("time", prepare_config)}]")
+                ax.set_ylabel("bonded fraction [dimensionless]")
+                ax.set_title(f"{trajname}: bonded fraction {type_1_name}-{type_2_name}, cutoff={dist:.4g} {unit_label("length", prepare_config)}")
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=8)
+                fig.tight_layout()
+
+                svg_path = os.path.join(output_dir, f"{trajname}_bonds_{pair_tag}_timeseries.svg")
+                fig.savefig(svg_path, bbox_inches="tight")
+                plt.close(fig)
+
+            all_timeseries.append(timeseries_df)
+            all_summaries.append(summary_df)
+
+        if len(all_timeseries) == 1:
+            return all_timeseries[0], all_summaries[0]
+        return all_timeseries, all_summaries
+
+
+
+# =============================================================================
+# MSD
+# =============================================================================
+
+# =============================================================================
+# MSD
+# =============================================================================
+
+
+def _box_vectors_from_hoomd_box(box_like):
+    """
+    Convert a HOOMD box array [Lx, Ly, Lz, xy, xz, yz] into box vectors.
+
+    Works for orthorhombic and triclinic boxes. For orthorhombic boxes,
+    xy=xz=yz=0 and this reduces to diag(Lx, Ly, Lz).
+
+    HOOMD image unwrapping:
+        unwrapped = wrapped + image_x*a + image_y*b + image_z*c
+    """
+    b = np.asarray(box_like, dtype=float)
+    Lx, Ly, Lz = b[:3]
+
+    xy = float(b[3]) if b.size > 3 else 0.0
+    xz = float(b[4]) if b.size > 4 else 0.0
+    yz = float(b[5]) if b.size > 5 else 0.0
+
+    a = np.array([Lx, 0.0, 0.0], dtype=float)
+    bv = np.array([xy * Ly, Ly, 0.0], dtype=float)
+    c = np.array([xz * Lz, yz * Lz, Lz], dtype=float)
+
+    return np.vstack([a, bv, c])
+
+
+def _unwrap_positions_manual(positions, images, boxes, images_available=True):
+    """
+    Manually unwrap HOOMD positions using particle image vectors and each frame's
+    own box.
+
+    Parameters
+    ----------
+    positions : np.ndarray
+        Shape (n_frames, n_particles, 3), wrapped positions.
+    images : np.ndarray
+        Shape (n_frames, n_particles, 3), HOOMD image vectors.
+    boxes : np.ndarray
+        Shape (n_frames, 6) or (n_frames, 3), HOOMD boxes.
+    images_available : bool
+        If False, returns wrapped positions and warns.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (n_frames, n_particles, 3), unwrapped positions if images exist.
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+
+    if not images_available:
+        warnings.warn(
+            "Particle image vectors were not found in one or more frames. "
+            "Manual MSD will use wrapped positions, which may be incorrect "
+            "for long-time diffusion."
+        )
+        return positions.copy()
+
+    images = np.asarray(images, dtype=np.float64)
+    boxes = np.asarray(boxes, dtype=np.float64)
+
+    unwrapped = np.empty_like(positions, dtype=np.float64)
+
+    for i in range(positions.shape[0]):
+        box_vectors = _box_vectors_from_hoomd_box(boxes[i])
+        unwrapped[i] = positions[i] + images[i] @ box_vectors
+
+    return unwrapped
+
+
+def _manual_msd_direct(unwrapped_positions):
+    """
+    Manual direct MSD.
+
+    MSD(lag) = < |r_i(t_lag) - r_i(t_0)|^2 >_particles
+
+    This matches the direct idea: all displacements are measured relative to
+    the first saved frame.
+    """
+    r = np.asarray(unwrapped_positions, dtype=np.float64)
+    n_frames = r.shape[0]
+
+    if n_frames < 2:
+        return np.array([], dtype=int), np.array([], dtype=float)
+
+    r0 = r[0]
+    disp = r[1:] - r0[None, :, :]
+    sq_disp = np.sum(disp * disp, axis=2)
+    msd = np.mean(sq_disp, axis=1)
+
+    lag_indices = np.arange(1, n_frames, dtype=int)
+    return lag_indices, msd
+
+
+def _manual_msd_window(unwrapped_positions):
+    """
+    Manual window-averaged MSD.
+
+    MSD(lag) = < |r_i(t + lag) - r_i(t)|^2 >_{particles, time origins}
+
+    This is more statistically averaged than direct MSD, but costs more because
+    it loops over all lags.
+    """
+    r = np.asarray(unwrapped_positions, dtype=np.float64)
+    n_frames = r.shape[0]
+
+    if n_frames < 2:
+        return np.array([], dtype=int), np.array([], dtype=float)
+
+    lag_indices = np.arange(1, n_frames, dtype=int)
+    msd = np.empty(n_frames - 1, dtype=float)
+
+    for out_i, lag in enumerate(tqdm(lag_indices, desc="Manual MSD window", leave=False)):
+        disp = r[lag:] - r[:-lag]
+        sq_disp = np.sum(disp * disp, axis=2)
+        msd[out_i] = float(np.mean(sq_disp))
+
+    return lag_indices, msd
+
+
+def _collect_msd_arrays_from_traj(traj, species_ids):
+    """
+    Collect wrapped positions, image vectors, box lengths, and box metadata
+    for selected species.
+
+    Uses the particle order/type IDs in the first frame to define the species
+    mask. This assumes particle order and type identity are stable over the
+    trajectory, which is the normal case for these HOOMD simulations.
+    """
+    species_ids = [int(s) for s in species_ids]
+
+    first = traj[0] 
+    last = traj[len(traj) - 1]
+
+    typeids0 = np.asarray(first.particles.typeid, dtype=int)
+    mask = np.isin(typeids0, species_ids)
+
+    if not np.any(mask):
+        return None
+
+    positions = []
+    images = []
+    boxes = []
+
+    images_available = True
+    first_box = np.asarray(first.configuration.box, dtype=float)
+    last_box = np.asarray(last.configuration.box, dtype=float)
+    first_box_lengths = np.asarray(first.configuration.box[:3], dtype=float)
+    last_box_lengths = np.asarray(last.configuration.box[:3], dtype=float)
+    boxes_change = False
+
+    for frame in tqdm(traj, desc="MSD positions", leave=False):
+        pos = np.asarray(frame.particles.position, dtype=np.float64)
+        positions.append(pos[mask])
+
+        frame_box = np.asarray(frame.configuration.box, dtype=np.float64)
+        boxes.append(frame_box)
+
+        frame_box_lengths = np.asarray(frame.configuration.box[:3], dtype=float)
+        if not np.allclose(frame_box_lengths, first_box_lengths):
+            boxes_change = True
+
+        try:
+            img = np.asarray(frame.particles.image, dtype=np.int64)
+            if img.shape[0] != frame.particles.N:
+                raise AttributeError
+            images.append(img[mask])
+        except Exception:
+            images_available = False
+            images.append(np.zeros_like(positions[-1], dtype=np.int64))
+
+    positions = np.asarray(positions, dtype=np.float64)
+    images = np.asarray(images, dtype=np.int64)
+    boxes = np.asarray(boxes, dtype=np.float64)
+
+    if positions.shape[0] < 2:
+        return None
+
+    return {
+        "positions": positions,
+        "images": images,
+        "boxes": boxes,
+        "mask": mask,
+        "n_particles": int(np.sum(mask)),
+        "images_available": bool(images_available),
+        "boxes_change": bool(boxes_change),
+        "first_box": first_box,
+        "last_box": last_box,
+        "first_box_Lx_nm": float(first_box_lengths[0]),
+        "first_box_Ly_nm": float(first_box_lengths[1]),
+        "first_box_Lz_nm": float(first_box_lengths[2]),
+        "last_box_Lx_nm": float(last_box_lengths[0]),
+        "last_box_Ly_nm": float(last_box_lengths[1]),
+        "last_box_Lz_nm": float(last_box_lengths[2]),
+    }
+
+
+def compute_msd_from_traj(traj, species_ids, method="freud_window"):
+    """
+    Compute MSD for selected species.
+
+    Available methods
+    -----------------
+    freud_direct, freud, direct
+        Uses freud.msd.MSD(box, mode="direct"). This is the default.
+        The Freud box is taken from the LAST frame.
+
+    freud_window, window
+        Uses freud.msd.MSD(box, mode="window").
+        The Freud box is taken from the LAST frame.
+
+    manual_direct, manual, numpy, numpy_direct
+        Manual NumPy direct MSD:
+            MSD(lag) = < |r_i(t_lag) - r_i(t_0)|^2 >_particles
+        Positions are manually unwrapped using HOOMD image vectors and each
+        frame's own box.
+
+    manual_window, numpy_window
+        Manual NumPy window MSD:
+            MSD(lag) = < |r_i(t + lag) - r_i(t)|^2 >_{particles, time origins}
+        Positions are manually unwrapped using HOOMD image vectors and each
+        frame's own box.
+
+    Notes
+    -----
+    The returned MSD excludes lag 0 so log-log plots and CSVs start at the
+    first positive lag.
+    """
+    method = str(method).strip().lower()
+
+    freud_aliases = {
+        "freud": "direct",
+        "freud_direct": "direct",
+        "direct": "direct",
+        "freud_window": "window",
+        "window": "window",
+    }
+
+    manual_aliases = {
+        "manual": "direct",
+        "manual_direct": "direct",
+        "numpy": "direct",
+        "numpy_direct": "direct",
+        "manual_window": "window",
+        "numpy_window": "window",
+    }
+
+    allowed = set(freud_aliases) | set(manual_aliases)
+    if method not in allowed:
+        raise ValueError(
+            "MSD method must be one of: "
+            "'freud_direct', 'freud_window', 'manual_direct', or 'manual_window'."
+        )
+
+    arrays = _collect_msd_arrays_from_traj(traj, species_ids)
+    if arrays is None:
+        return None
+
+    positions = arrays["positions"]
+    images = arrays["images"]
+    boxes = arrays["boxes"]
+    images_available = arrays["images_available"]
+    boxes_change = arrays["boxes_change"]
+
+    if method in freud_aliases:
+        freud_mode = freud_aliases[method]
+
+        if not images_available:
+            warnings.warn(
+                "Particle image vectors were not found in one or more frames. "
+                "freud MSD will be computed from wrapped positions, which may "
+                "be incorrect for long-time diffusion."
+            )
+
+        if boxes_change:
+            warnings.warn(
+                "The box changes during this trajectory. freud.msd.MSD assumes "
+                "a single periodic box; using the LAST-frame box."
+            )
+
+        # Important: use the final simulation box, not the initial box.
+        # This matters for elongated/resized trajectories.
+        last_box_array = arrays["last_box"]
+        box = freud.box.Box.from_box(last_box_array)
+
+        msd_calc = freud.msd.MSD(box, mode=freud_mode)
+
+        if images_available:
+            try:
+                msd_calc.compute(positions, images=images, reset=True)
+            except TypeError:
+                msd_calc.compute(positions, images=images)
+        else:
+            try:
+                msd_calc.compute(positions, reset=True)
+            except TypeError:
+                msd_calc.compute(positions)
+
+        msd_raw = np.asarray(msd_calc.msd, dtype=np.float64)
+        lag_indices = np.arange(len(msd_raw), dtype=int)
+
+        positive = lag_indices > 0
+        lag_indices = lag_indices[positive]
+        msd = msd_raw[positive]
+
+        return {
+            "lag_indices": lag_indices,
+            "msd": msd,
+            "n_particles": arrays["n_particles"],
+            "images_available": bool(images_available),
+            "msd_method": f"freud_{freud_mode}",
+            "freud_mode": freud_mode,
+            "manual_mode": None,
+            "box_used_for_freud_msd": "last_frame",
+            "box_used_for_manual_unwrap": None,
+            "boxes_change": bool(boxes_change),
+            "first_box_Lx_nm": arrays["first_box_Lx_nm"],
+            "first_box_Ly_nm": arrays["first_box_Ly_nm"],
+            "first_box_Lz_nm": arrays["first_box_Lz_nm"],
+            "last_box_Lx_nm": arrays["last_box_Lx_nm"],
+            "last_box_Ly_nm": arrays["last_box_Ly_nm"],
+            "last_box_Lz_nm": arrays["last_box_Lz_nm"],
+        }
+
+    manual_mode = manual_aliases[method]
+
+    if boxes_change:
+        warnings.warn(
+            "The box changes during this trajectory. Manual MSD will unwrap "
+            "each frame using that frame's own HOOMD box and image vectors."
+        )
+
+    unwrapped = _unwrap_positions_manual(
+        positions=positions,
+        images=images,
+        boxes=boxes,
+        images_available=images_available,
+    )
+
+    if manual_mode == "direct":
+        lag_indices, msd = _manual_msd_direct(unwrapped)
+    elif manual_mode == "window":
+        lag_indices, msd = _manual_msd_window(unwrapped)
+    else:
+        raise ValueError(f"Unknown manual MSD mode: {manual_mode}")
+
+    return {
+        "lag_indices": lag_indices,
+        "msd": msd,
+        "n_particles": arrays["n_particles"],
+        "images_available": bool(images_available),
+        "msd_method": f"manual_{manual_mode}",
+        "freud_mode": None,
+        "manual_mode": manual_mode,
+        "box_used_for_freud_msd": None,
+        "box_used_for_manual_unwrap": "per_frame_box",
+        "boxes_change": bool(boxes_change),
+        "first_box_Lx_nm": arrays["first_box_Lx_nm"],
+        "first_box_Ly_nm": arrays["first_box_Ly_nm"],
+        "first_box_Lz_nm": arrays["first_box_Lz_nm"],
+        "last_box_Lx_nm": arrays["last_box_Lx_nm"],
+        "last_box_Ly_nm": arrays["last_box_Ly_nm"],
+        "last_box_Lz_nm": arrays["last_box_Lz_nm"],
+    }
+
+
+def _positive_msd_dataframe(msd_df):
+    return msd_df[
+        (msd_df["time_ps"] > 0)
+        & (msd_df["msd_nm2"] > 0)
+        & np.isfinite(msd_df["time_ps"])
+        & np.isfinite(msd_df["msd_nm2"])
+    ].copy().sort_values("time_ps").reset_index(drop=True)
+
+
+def thin_points_log_time_df(df, bins_per_decade=35, min_points_to_thin=350):
+    """Thin dense log-time data for plotting without changing the saved CSV."""
+    if df is None or len(df) < int(min_points_to_thin):
+        return df
+
+    d = _positive_msd_dataframe(df)
+    if len(d) == 0:
+        return d
+
+    log_time = np.log10(d["time_ps"].to_numpy(dtype=float))
+    d["_log_bin"] = np.floor(log_time * float(bins_per_decade)).astype(int)
+    return (
+        d.groupby("_log_bin", sort=True, as_index=False)
+        .agg({"time_ps": "median", "msd_nm2": "median"})
+        .sort_values("time_ps")
+        .reset_index(drop=True)
+    )
+
+
+def _right_third_log_range(x_min, x_max):
+    x_min = float(x_min)
+    x_max = float(x_max)
+    if not (np.isfinite(x_min) and np.isfinite(x_max)) or x_min <= 0 or x_max <= x_min:
+        return np.nan, np.nan
+    log_min = np.log10(x_min)
+    log_max = np.log10(x_max)
+    log_cut = log_min + (2.0 / 3.0) * (log_max - log_min)
+    return 10.0 ** log_cut, x_max
+
+
+def compute_msd_diffusive_trend(msd_df, tail_fraction=0.25):
+    """
+    Compute the late-time t^1 reference trend using the reference-code metric.
+
+    D_fit here is the slope used in the plotted relationship MSD = D_fit * t,
+    matching the example code. It is calculated from the final positive data
+    point in the late-time fitting window, not from a global linear regression
+    and not divided by 6.
+    """
+    d = _positive_msd_dataframe(msd_df)
+    if len(d) < 2:
+        return None
+
+    n_fit = max(2, int(np.ceil(float(tail_fraction) * len(d))))
+    fit_df = d.iloc[-n_fit:].copy()
+    if len(fit_df) < 2:
+        return None
+
+    t_last = float(fit_df.iloc[-1]["time_ps"])
+    msd_last = float(fit_df.iloc[-1]["msd_nm2"])
+    if t_last <= 0 or msd_last <= 0:
+        return None
+
+    D_fit = msd_last / t_last
+    fit_x_min = float(fit_df["time_ps"].min())
+    fit_x_max = float(fit_df["time_ps"].max())
+    trend_x_min, trend_x_max = _right_third_log_range(fit_x_min, fit_x_max)
+
+    return {
+        "D_fit": float(D_fit),
+        "fit_x_min": fit_x_min,
+        "fit_x_max": fit_x_max,
+        "trend_x_min": trend_x_min,
+        "trend_x_max": trend_x_max,
+        "n_fit_points": int(len(fit_df)),
+    }
+
+
+def analyze_msd(
+    traj_file,
+    species_ids=None,
+    dt=0.001,
+    msd_method="freud_window",
+    output_dir=".",
+    plot=False,
+    prepare_config=None,
+):
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+
+    with open_traj(traj_file) as traj:
+        first_box_lengths = np.asarray(traj[0].configuration.box[:3], dtype=float)
+        last_box_lengths = np.asarray(traj[-1].configuration.box[:3], dtype=float)
+        sim_geom = prepare_config["BOX"]["simulation_geometry"]
+        run_mode = prepare_config["RUN"]["mode"]
+        time_info = prepare_config["TIME"]
+        steps_NVT_EQ = time_info["sim_steps_NVT_EQ"]
+        writer_steps = time_info["writer_steps"]
+
+        if np.all(first_box_lengths == last_box_lengths):
+            ct_box_traj = traj
+            print("Box size was constant for the entire trajectory.")
+        elif "load_no_expand" in run_mode:       #  Could also add: (or "phase_diagram" in run_mode), but currently if I used a phase_diagram I have a mix of different trajectories
+            ct_box_traj = traj
+            print("Box size was constant for the entire trajectory.")
+        elif "droplet" not in sim_geom:
+            ct_ind = int(steps_NVT_EQ // writer_steps + 1)
+            ct_box_traj = traj[ct_ind:]
+            print(f"Box size was not constant for the entire trajectory. Frame found from which the box size is final: {ct_ind}")
+        else:
+            steps_after_EQ = time_info["sim_steps_Elongation"]
+            elong_dur = time_info["elongation_duration"]
+            slab_time_fraction = prepare_config["BOX"]["droplet_slab_stage_fraction"]
+            ct_ind = int((steps_NVT_EQ + steps_after_EQ*slab_time_fraction + elong_dur*(1 - slab_time_fraction)) // writer_steps + 1)
+            ct_box_traj = traj[ct_ind:]
+            print(f"Box size was not constant for the entire trajectory. Frame found from which the box size is final: {ct_ind}")
+
+        first = ct_box_traj[0]
+
+        if species_ids is None:
+            species_ids = [default_reference_species(first, prepare_config=prepare_config)]
+
+        species_ids = [int(s) for s in species_ids]
+        species_tag = "-".join(str(s) for s in species_ids)
+        species_names = [typeid_to_name(first, s) for s in species_ids]
+
+        out = compute_msd_from_traj(ct_box_traj, species_ids, method=msd_method)
+
+        if out is None:
+            print(f"Skipping MSD: no particles found for species {species_ids}")
+            return None, None
+
+        steps = np.array([ct_box_traj[i].configuration.step for i in range(len(ct_box_traj))], dtype=float)
+
+    if len(steps) >= 2:
+        frame_step_interval = float(np.median(np.diff(steps)))
+    else:
+        frame_step_interval = 1.0
+
+    lag_time_reduced = out["lag_indices"].astype(float) * frame_step_interval * float(dt)
+    lag_time = convert_quantity(lag_time_reduced, "time", prepare_config)
+    msd_values = convert_quantity(out["msd"], "area", prepare_config)
+
+    msd_df = pd.DataFrame({
+        "lag_frames": out["lag_indices"],
+        "lag_steps": out["lag_indices"] * frame_step_interval,
+        "time_ps": lag_time,
+        "msd_nm2": msd_values,
+        "trajname": trajname,
+        "kT_kJ_per_mol": convert_quantity([kT], "temperature", prepare_config)[0] if np.isfinite(kT) else kT,
+        "species_ids": species_tag,
+        "species_names": ",".join(species_names),
+    })
+
+    trend = compute_msd_diffusive_trend(msd_df, tail_fraction=0.25)
+    if trend is None:
+        D_fit = np.nan
+        fit_x_min = fit_x_max = trend_x_min = trend_x_max = np.nan
+        n_fit_points = 0
+    else:
+        D_fit = trend["D_fit"]
+        fit_x_min = trend["fit_x_min"]
+        fit_x_max = trend["fit_x_max"]
+        trend_x_min = trend["trend_x_min"]
+        trend_x_max = trend["trend_x_max"]
+        n_fit_points = trend["n_fit_points"]
+
+    summary_df = pd.DataFrame([{
+        "trajname": trajname,
+        "kT_kJ_per_mol": convert_quantity([kT], "temperature", prepare_config)[0] if np.isfinite(kT) else kT,
+        "species_ids": species_tag,
+        "species_names": ",".join(species_names),
+        "n_particles": out["n_particles"],
+        "n_frames": len(steps),
+        "n_lags": len(msd_df),
+        "dt_ps": dt,
+        "frame_step_interval": frame_step_interval,
+        "frame_time_interval_ps": frame_step_interval * dt,
+        "D_fit_nm2_per_ps": D_fit,
+        "D_fit_definition": "late-time reference slope in MSD = D_fit * t; not divided by 6",
+        "MSD_fit_tail_fraction": 0.25,
+        "MSD_fit_n_points": n_fit_points,
+        "MSD_fit_start_time_ps": fit_x_min,
+        "MSD_fit_end_time_ps": fit_x_max,
+        "MSD_trend_start_time_ps": trend_x_min,
+        "MSD_trend_end_time_ps": trend_x_max,
+        "images_available": out["images_available"],
+        "msd_method": out.get("msd_method", msd_method),
+        "freud_mode": out.get("freud_mode", None),
+        "manual_mode": out.get("manual_mode", None),
+        "box_used_for_freud_msd": out.get("box_used_for_freud_msd", None),
+        "box_used_for_manual_unwrap": out.get("box_used_for_manual_unwrap", None),
+        "boxes_change": out.get("boxes_change", False),
+        "first_box_Lx_nm": out.get("first_box_Lx_nm", np.nan),
+        "first_box_Ly_nm": out.get("first_box_Ly_nm", np.nan),
+        "first_box_Lz_nm": out.get("first_box_Lz_nm", np.nan),
+        "last_box_Lx_nm": out.get("last_box_Lx_nm", np.nan),
+        "last_box_Ly_nm": out.get("last_box_Ly_nm", np.nan),
+        "last_box_Lz_nm": out.get("last_box_Lz_nm", np.nan),
+    }])
+
+    msd_csv = os.path.join(output_dir, f"{trajname}_species_{safe_name(species_tag)}_msd.csv")
+    summary_csv = os.path.join(output_dir, f"{trajname}_species_{safe_name(species_tag)}_msd_summary.csv")
+
+    msd_df = add_hoomd_unit_metadata(msd_df, dt=dt, prepare_config=prepare_config)
+    summary_df = add_hoomd_unit_metadata(summary_df, dt=dt, prepare_config=prepare_config)
+
+    msd_df.to_csv(msd_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+        plot_df_full = _positive_msd_dataframe(msd_df)
+        plot_df = thin_points_log_time_df(plot_df_full, bins_per_decade=35, min_points_to_thin=350)
+
+        if len(plot_df) > 0:
+            ax.plot(
+                plot_df["time_ps"].values,
+                plot_df["msd_nm2"].values,
+                linestyle="none",
+                marker="o",
+                markersize=4.8,
+                markerfacecolor="none",
+                markeredgecolor="black",
+                color="black",
+                alpha=0.90,
+                label="MSD",
+            )
+
+        if trend is not None and np.isfinite(D_fit) and D_fit > 0 and np.isfinite(trend_x_min) and np.isfinite(trend_x_max):
+            tline = np.logspace(np.log10(trend_x_min), np.log10(trend_x_max), 150)
+            ax.plot(
+                tline,
+                D_fit * tline,
+                linestyle=":",
+                linewidth=2.2,
+                alpha=0.9,
+                label=r"late-time $t^1$ trend",
+            )
+            ax.text(
+                0.98,
+                0.98,
+                f"D_fit = {D_fit:.2E} {unit_label('diffusion', prepare_config)}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            )
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(f"time [{unit_label('time', prepare_config)}]")
+        ax.set_ylabel(f"MSD [{unit_label('area', prepare_config)}]")
+        ax.set_title(f"{trajname}: MSD species {species_tag}")
+        ax.grid(alpha=0.3, which="both")
+        ax.legend()
+        fig.tight_layout()
+
+        svg_path = os.path.join(output_dir, f"{trajname}_species_{safe_name(species_tag)}_msd.svg")
+        fig.savefig(svg_path, bbox_inches="tight")
+        plt.close(fig)
+
+    return msd_df, summary_df
+    
+
+# =============================================================================
+# RDF
+# =============================================================================
+
+
+RDF_METHODS = {
+    "freud",
+    "freud_histogram",
+    "raw",
+    "scaled",
+    "volume_corrected",
+    "volume_corrected_scaled",
+    "density_normalized",
+    "freud_finite_size",
+    "interface_corrected",
+    "rand_uniform_corrected",
+}
+INTERFACE_F_MIN = 0.05      # interface_corrected: g(r) is NaN where f(r) drops below this
+_OVERLAP_SHELL_CACHE = {}
+RAND_UNIFORM_FACTOR = 5.0        # rand_uniform_corrected: random points per region particle
+RAND_UNIFORM_MIN_POINTS = 2000   # ... but at least this many
+RAND_UNIFORM_MAX_POINTS = 50000  # ... and at most this many (cost grows with M^2)
+RAND_UNIFORM_SEED = 12345        # Per-frame seed = this + frame index, so runs are reproducible. NEVER CHANGE THIS NUMBER!!!
+
+
+def slab_x_shift(frame, species_id):
+    """x position of the slab in this frame: the volume-weighted periodic
+    centre of mass of species_id along x (0.0 if the species is absent)."""
+    pos = np.asarray(frame.particles.position, dtype=float)
+    tid = np.asarray(frame.particles.typeid, dtype=int)
+    mask = tid == int(species_id)
+    if not np.any(mask):
+        return 0.0
+    box_lengths = np.asarray(frame.configuration.box[:3], dtype=float)
+    weights = (np.pi / 6.0) * particle_diameters(frame)[mask] ** 3
+    return float(periodic_center_of_mass(pos[mask], box_lengths, weights=weights)[0])
+
+
+def slab_bounds_one_frame(frame, species_id, n_bins, transition_buffer, smooth_window,
+                          shift=0.0, min_contrast=1.5):
+    """
+    Slab bounds (x_in_min, x_in_max, buffer_min, buffer_max) from ONE frame.
+
+    Histograms species_id along x in this frame (after subtracting `shift`,
+    the recentring offset, if non-zero) and runs the same Binseg detection as
+    the averaged path, through detect_dense_region_1d so a frame without a
+    clear slab (contrast < min_contrast, dense segment > 90% of the box, or
+    too few dilute bins) returns None instead of nonsense bounds.
+    """
+    Lx, Ly, Lz = (float(v) for v in frame.configuration.box[:3])
+    pos = np.asarray(frame.particles.position, dtype=float)
+    tid = np.asarray(frame.particles.typeid, dtype=int)
+    x = pos[tid == int(species_id), 0]
+    if x.size == 0:
+        return None
+    if shift:
+        x = _wrap_to_box(x - shift, Lx)
+    edges = np.linspace(-Lx / 2.0, Lx / 2.0, int(n_bins) + 1)
+    counts, _ = np.histogram(x, bins=edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    density = counts / ((Lx / int(n_bins)) * Ly * Lz)
+    det = detect_dense_region_1d(
+        centers, density,
+        transition_buffer=transition_buffer,
+        smooth_window=smooth_window,
+        min_contrast=min_contrast,
+    )
+    if not det["detected"]:
+        return None
+    return (det["in_min"], det["in_max"], det["buffer_min"], det["buffer_max"])
+
+
+def compute_number_density_profile(
+    traj,
+    species_id,
+    top_percentage=0.75,
+    n_bins=200,
+    last_frames=None,
+    recenter_species=None
+):
+    """
+    Compute 1D number-density profile along x for one species.
+
+    last_frames=N averages over exactly the final N frames instead of the
+    top_percentage window.
+    """
+    n_frames = len(traj)
+    start_frame, _ = density3d_frame_range(n_frames, top_percentage, last_frames=last_frames)
+
+    frame0 = traj[start_frame]
+    Lx, Ly, Lz = frame0.configuration.box[:3]
+
+    x_min, x_max = -Lx / 2, Lx / 2
+    bins = np.linspace(x_min, x_max, n_bins + 1)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    dx = Lx / n_bins
+    bin_volume = dx * Ly * Lz
+
+    counts_accum = np.zeros(n_bins, dtype=float)
+    frames_used = 0
+
+    for i in range(start_frame, n_frames):
+        frame = traj[i]
+        pos = np.asarray(frame.particles.position, dtype=float)
+        tid = np.asarray(frame.particles.typeid, dtype=int)
+        x = pos[tid == species_id, 0]
+        if recenter_species is not None:
+            x = _wrap_to_box(x - slab_x_shift(frame, recenter_species), Lx)
+        counts, _ = np.histogram(x, bins=bins)
+        counts_accum += counts
+        frames_used += 1
+
+    if frames_used == 0:
+        return None
+
+    density = (counts_accum / frames_used) / bin_volume
+
+    return pd.DataFrame({
+        "X": centers,
+        "Density": density,
+    })
+
+
+def _tail_scale_to_one(y, normalize_tail_bins=10):
+    if y is None:
+        return None
+
+    y = np.asarray(y, dtype=float)
+
+    if normalize_tail_bins <= 0:
+        return y
+
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return y
+
+    finite_indices = np.where(finite)[0]
+    tail_indices = finite_indices[-min(int(normalize_tail_bins), len(finite_indices)):]
+    tail = y[tail_indices]
+    mean_tail = np.nanmean(tail)
+
+    if not np.isfinite(mean_tail) or mean_tail == 0:
+        return y
+
+    return y / mean_tail
+
+
+def _tail_normalization_factor(y, normalize_tail_bins=10):
+    """Return factor f such that y / f has a long-distance tail near 1."""
+    if y is None or normalize_tail_bins <= 0:
+        return np.nan
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return np.nan
+    finite_indices = np.where(finite)[0]
+    tail_indices = finite_indices[-min(int(normalize_tail_bins), len(finite_indices)):]
+    factor = float(np.nanmean(y[tail_indices]))
+    return factor if np.isfinite(factor) and factor != 0 else np.nan
+
+
+def _apply_tail_normalization(y, normalize_tail_bins=10):
+    factor = _tail_normalization_factor(y, normalize_tail_bins)
+    if not np.isfinite(factor):
+        return y, np.nan
+    return np.asarray(y, dtype=float) / factor, factor
+
+
+def _find_first_minimum_after_first_peak(r, g, r_peak_min=0.2):
+    if g is None or len(g) < 5:
+        return np.nan
+
+    r = np.asarray(r, dtype=float)
+    g = np.asarray(g, dtype=float)
+
+    valid = np.isfinite(r) & np.isfinite(g)
+    r = r[valid]
+    g = g[valid]
+
+    if len(g) < 5:
+        return np.nan
+
+    start_idx = np.searchsorted(r, r_peak_min)
+
+    if start_idx >= len(r) - 2:
+        return np.nan
+
+    g_sub = g[start_idx:]
+    peak_rel = np.argmax(g_sub)
+    peak_idx = start_idx + peak_rel
+
+    for i in range(peak_idx + 1, len(g) - 1):
+        if g[i] <= g[i - 1] and g[i] <= g[i + 1]:
+            return float(r[i])
+
+    return float(r[-1])
+
+
+def _coordination_number_from_gr(r, g, rho_region, r_cut=None):
+    if g is None or rho_region is None or not np.isfinite(rho_region) or rho_region <= 0:
+        return np.nan
+
+    r = np.asarray(r, dtype=float)
+    g = np.asarray(g, dtype=float)
+
+    valid = np.isfinite(r) & np.isfinite(g)
+    r = r[valid]
+    g = g[valid]
+
+    if len(r) < 2:
+        return np.nan
+
+    if r_cut is None or not np.isfinite(r_cut):
+        r_cut = _find_first_minimum_after_first_peak(r, g)
+
+    if not np.isfinite(r_cut):
+        return np.nan
+
+    mask = r <= r_cut
+
+    if np.sum(mask) < 2:
+        return np.nan
+
+    integrand = 4.0 * np.pi * rho_region * g[mask] * r[mask] ** 2
+    return float(np.trapezoid(integrand, r[mask]))
+
+
+def compute_distance_histogram_with_freud(points, box, rdf_bins, r_max):
+    if points.shape[0] < 2:
+        edges = np.linspace(0.0, r_max, rdf_bins + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        return centers, np.zeros(rdf_bins, dtype=float)
+
+    aq = freud.locality.AABBQuery(box, points)
+
+    nlist = aq.query(
+        points,
+        dict(mode="ball", r_max=r_max, exclude_ii=True),
+    ).toNeighborList()
+
+    dists = np.asarray(nlist.distances, dtype=float)
+    hist, edges = np.histogram(dists, bins=rdf_bins, range=(0.0, r_max))
+
+    # For same set, each pair is directed twice.
+    hist = hist.astype(float) / 2.0
+
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return centers, hist
+
+
+def _overlap_shells(shape, steps, r_reach):
+    """Displacement shells on a periodic voxel grid, cached per grid and reach.
+
+    Returns (flat_index, shell_id, shell_radius): the flat indices of every
+    grid displacement no longer than r_reach (minimum image), which shell of
+    width max(steps) each one falls in, and the mean length of each shell.
+    """
+    key = (tuple(int(n) for n in shape), tuple(round(float(h), 9) for h in steps), round(float(r_reach), 9))
+    if key in _OVERLAP_SHELL_CACHE:
+        return _OVERLAP_SHELL_CACHE[key]
+    disp = []
+    for n, h in zip(shape, steps):
+        i = np.arange(int(n))
+        disp.append(np.where(i <= n // 2, i, i - n) * float(h))
+    dx, dy, dz = np.meshgrid(*disp, indexing="ij", sparse=True)
+    length = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2).ravel()
+    flat_index = np.nonzero(length <= r_reach)[0]
+    width = float(max(steps))
+    shell_id = np.floor(length[flat_index] / width + 0.5).astype(int)   # shell k is centred on k*width
+    counts = np.bincount(shell_id)
+    with np.errstate(invalid="ignore"):
+        shell_radius = np.bincount(shell_id, weights=length[flat_index]) / counts
+    out = (flat_index, shell_id, shell_radius)
+    _OVERLAP_SHELL_CACHE[key] = out
+    return out
+
+
+def region_overlap_fraction_mask(mask, steps, r):
+    """
+    f(r) for a region given as a voxel mask in the periodic box.
+
+    f(r) is the average fraction of a sphere surface of radius r, centred on a
+    uniformly random point of the region, that lies inside the region.  It is
+    the region's isotropic set covariogram divided by its volume:
+        C(d) = sum_x mask(x) mask(x + d)        (periodic, via FFT)
+        f(r) = <C(d)>_{|d| = r} / C(0)
+    The spherical average is taken over shells one voxel wide and interpolated
+    onto r, with f(0) = 1.
+    """
+    m = np.asarray(mask, dtype=np.float64)
+    n_vox = float(m.sum())
+    r = np.asarray(r, dtype=float)
+    if n_vox == 0:
+        return np.full(r.shape, np.nan)
+    F = np.fft.rfftn(m)
+    C = np.fft.irfftn(F * np.conj(F), s=m.shape, axes=(0, 1, 2)).ravel()
+    r_reach = float(np.max(r)) + 2.0 * float(max(steps))
+    flat_index, shell_id, shell_radius = _overlap_shells(m.shape, steps, r_reach)
+    counts = np.bincount(shell_id)
+    with np.errstate(invalid="ignore"):
+        shell_mean = np.bincount(shell_id, weights=C[flat_index]) / counts
+    ok = counts > 0
+    f_shell = np.clip(shell_mean[ok] / n_vox, 0.0, 1.0)
+    return np.interp(r, shell_radius[ok], f_shell)
+
+
+def region_overlap_fraction_slab(in_region, L, r, n_grid=4096):
+    """
+    f(r) for a slab-type region: the same set in y and z everywhere, defined
+    along x by the boolean function in_region(x) on the periodic box [-L/2, L/2).
+
+    With the 1D periodic autocorrelation c(s) = |{x : x and x+s in region}| / |region|,
+    a sphere direction with cos(theta) = u has an x-offset r*u, and u is
+    uniform on [0, 1], so f(r) = integral_0^1 c(r u) du.
+    """
+    r = np.asarray(r, dtype=float)
+    dx = float(L) / int(n_grid)
+    x = -0.5 * float(L) + (np.arange(int(n_grid)) + 0.5) * dx
+    m = np.asarray(in_region(x), dtype=np.float64)
+    n_in = float(m.sum())
+    if n_in == 0:
+        return np.full(r.shape, np.nan)
+    F = np.fft.rfft(m)
+    c = np.fft.irfft(F * np.conj(F), n=m.size) / n_in          # c[k] at offset k*dx
+    s = np.arange(m.size) * dx
+    u = (np.arange(400) + 0.5) / 400.0
+    offsets = np.mod(np.outer(r, u), float(L))
+    return np.clip(np.interp(offsets, s, c, period=float(L)).mean(axis=1), 0.0, 1.0)
+
+
+def n_random_points(n_region):
+    """How many uniform random points to draw for a region holding n_region particles."""
+    m = int(np.ceil(RAND_UNIFORM_FACTOR * max(int(n_region), 1)))
+    return int(min(max(m, RAND_UNIFORM_MIN_POINTS), RAND_UNIFORM_MAX_POINTS))
+
+
+def random_points_in_mask(mask, centers, box_lengths, n, rng):
+    """
+    n points uniformly distributed over a voxel region: a region voxel is
+    picked uniformly (all voxels have the same volume), then a uniform point
+    inside it.  Points are wrapped into [-L/2, L/2) for freud.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    flat = np.flatnonzero(mask)
+    if flat.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    pick = rng.choice(flat, size=int(n), replace=True)
+    idx = np.unravel_index(pick, mask.shape)
+    centers = [np.asarray(c, dtype=float) for c in centers]
+    steps = np.array([float(np.mean(np.diff(c))) for c in centers])
+    pts = np.column_stack([centers[a][idx[a]] for a in range(3)])
+    pts += (rng.random((int(n), 3)) - 0.5) * steps
+    L = np.asarray(box_lengths, dtype=float)
+    pts = (pts + L / 2.0) % L - L / 2.0
+    return pts.astype(np.float32)
+
+
+def random_points_in_slab(in_region, box_lengths, n, rng):
+    """
+    n points uniformly distributed over a slab-type region: x uniform over
+    the set where in_region(x) is True (by rejection on [-Lx/2, Lx/2)), y and
+    z uniform over the box.
+    """
+    L = np.asarray(box_lengths, dtype=float)
+    xs, have = [], 0
+    for _ in range(1000):
+        x = rng.uniform(-L[0] / 2.0, L[0] / 2.0, size=max(2 * int(n), 1000))
+        x = x[np.asarray(in_region(x), dtype=bool)]
+        xs.append(x)
+        have += x.size
+        if have >= n:
+            break
+    x = np.concatenate(xs)[: int(n)] if xs else np.empty(0)
+    if x.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    y = rng.uniform(-L[1] / 2.0, L[1] / 2.0, size=x.size)
+    z = rng.uniform(-L[2] / 2.0, L[2] / 2.0, size=x.size)
+    return np.column_stack([x, y, z]).astype(np.float32)
+
+
+def _rdf_region_curve(frame_box, freud_box, pts, V_region, V_box, method, rdf_bins, r_max,
+                      overlap=None, random_points=None, query_pts=None):
+    """
+    g(r) of one set of points (one region of one frame), for every method.
+
+    Shared by the slab and the droplet RDF so the two normalise identically.
+    Returns dict(r, selected, g_phys, rho_region, rho_box, f).
+    f(r) represents the average fraction of a shell with radius r that lies inside a specific homogeneous region.
+    """
+    cross = query_pts is not None
+    q_kw = {"query_points": query_pts} if cross else {}
+    if cross and method == "freud_histogram":
+        raise ValueError("freud_histogram is only implemented for same-species RDFs")
+    
+    n_region = pts.shape[0]
+    rho_region = n_region / V_region if V_region > 0 else np.nan
+    rho_box_region = n_region / V_box if V_box > 0 else np.nan
+
+    # Exact RDF is used for the optional normalisation variants and for the
+    # coordination-number metadata.
+    rdf_exact = freud.density.RDF(bins=rdf_bins, r_max=r_max, normalization_mode="exact")
+    rdf_exact.compute(system=(frame_box, pts), **q_kw)
+    g_exact = rdf_exact.rdf.copy()
+    r = rdf_exact.bin_centers.copy()
+
+    if np.isfinite(rho_region) and rho_region > 0 and np.isfinite(rho_box_region):
+        g_phys = g_exact * (rho_box_region / rho_region)
+    else:
+        g_phys = g_exact.copy()
+
+    if method == "freud":
+        rdf_freud = freud.density.RDF(bins=rdf_bins, r_max=r_max)
+        rdf_freud.compute(system=(frame_box, pts), **q_kw)
+        r = rdf_freud.bin_centers.copy()
+        selected = rdf_freud.rdf.copy()
+    elif method == "freud_histogram":
+        r, selected = compute_distance_histogram_with_freud(pts, freud_box, rdf_bins, r_max)
+    elif method in ("raw", "scaled"):
+        selected = g_exact
+    elif method == "density_normalized":
+        selected = g_phys
+    elif method in ("volume_corrected", "volume_corrected_scaled"):
+        selected = g_exact * (V_region / V_box if V_box > 0 else 1.0)
+    elif method == "freud_finite_size":
+        rdf_fs = freud.density.RDF(bins=rdf_bins, r_max=r_max, normalization_mode="finite_size")
+        rdf_fs.compute(system=(frame_box, pts), **q_kw)
+        selected = rdf_fs.rdf.copy()
+    elif method == "interface_corrected":
+        if overlap is None:
+            raise ValueError("interface_corrected needs the region's overlap function")
+        f = np.asarray(overlap(r), dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            selected = np.where(f >= INTERFACE_F_MIN, g_phys / f, np.nan)
+        return {"r": r, "selected": selected, "g_phys": selected,
+                "rho_region": rho_region, "rho_box": rho_box_region, "f": f}
+    elif method == "rand_uniform_corrected":
+        if random_points is None:
+            raise ValueError("rand_uniform_corrected needs the region's random-point generator")
+        rnd = random_points(n_random_points(n_region))
+        n_rnd = rnd.shape[0]
+        rdf_rnd = freud.density.RDF(bins=rdf_bins, r_max=r_max, normalization_mode="exact")
+        if cross:
+            # Random centres too: with the real centres the random curve has
+            # only N_center * M pairs per bin, which in a sparse region is too
+            # few, and dividing by a noisy curve biases g upward.
+            rnd_q = random_points(n_random_points(query_pts.shape[0]))
+            rdf_rnd.compute(system=(frame_box, rnd), query_points=rnd_q)
+        else:
+            rdf_rnd.compute(system=(frame_box, rnd))
+        g_rnd = rdf_rnd.rdf.copy()
+        # freud's "exact" mode normalises by N^2/V, so an ideal set of N points
+        # tends to (N-1)/N; undo that for the data and the random set.  A pair
+        # RDF has no self-pairs, so there it is 1.
+        if cross:
+            finite_size = 1.0
+        else:
+            finite_size = (n_region / (n_region - 1.0)) * ((n_rnd - 1.0) / n_rnd)
+        limit = (V_box / V_region) * INTERFACE_F_MIN if V_region > 0 else np.inf
+        with np.errstate(divide="ignore", invalid="ignore"):
+            selected = np.where(g_rnd >= limit, finite_size * g_exact / g_rnd, np.nan)
+        f_implied = g_rnd * (V_region / V_box) * (1.0 if cross else n_rnd / (n_rnd - 1.0))   # the f(r) the random set measured
+        return {"r": r, "selected": selected, "g_phys": selected,
+                "rho_region": rho_region, "rho_box": rho_box_region, "f": f_implied}
+    else:
+        raise ValueError(f"Unknown RDF method {method!r}")
+
+    return {"r": r, "selected": selected, "g_phys": g_phys,
+            "rho_region": rho_region, "rho_box": rho_box_region, "f": None}
+
+
+class _RDFAccumulator:
+    """Collects per-frame, per-region RDF curves and reduces them at the end."""
+
+    def __init__(self):
+        self.r = None
+        self.curves = {"inside": [], "outside": []}
+        self.phys = {"inside": [], "outside": []}
+        self.rho = {"inside": [], "outside": []}
+        self.rho_box = {"inside": [], "outside": []}
+        self.volume = {"inside": [], "outside": []}
+        self.count = {"inside": [], "outside": []}
+        self.Z = {"inside": [], "outside": []}
+        self.Z_cut = {"inside": [], "outside": []}
+        self.f = {"inside": [], "outside": []}
+
+    def add(self, region, curve, V_region, n_region):
+        self.r = curve["r"]
+        if curve.get("f") is not None:
+            self.f[region].append(curve["f"])
+        self.curves[region].append(curve["selected"])
+        self.phys[region].append(curve["g_phys"])
+        self.rho[region].append(curve["rho_region"])
+        self.rho_box[region].append(curve["rho_box"])
+        self.volume[region].append(float(V_region))
+        self.count[region].append(int(n_region))
+        z_cut = _find_first_minimum_after_first_peak(self.r, curve["g_phys"])
+        z_val = _coordination_number_from_gr(self.r, curve["g_phys"], curve["rho_region"], r_cut=z_cut)
+        if np.isfinite(z_val):
+            self.Z[region].append(float(z_val))
+        if np.isfinite(z_cut):
+            self.Z_cut[region].append(float(z_cut))
+
+    def empty(self):
+        return not self.curves["inside"] and not self.curves["outside"]
+
+    def result(self, method, normalize_tail_bins):
+        def _mean(lst):
+            if not lst:
+                return None
+            with warnings.catch_warnings():          # "interface_corrected" leaves NaN where f(r) is tiny
+                warnings.simplefilter("ignore", RuntimeWarning)
+                return np.nanmean(np.vstack(lst), axis=0)
+
+        def _m(lst):
+            return float(np.nanmean(lst)) if lst else np.nan
+
+        def _sd(lst):
+            return float(np.nanstd(lst)) if lst else np.nan
+
+        inside, outside = _mean(self.curves["inside"]), _mean(self.curves["outside"])
+        inside_phys, outside_phys = _mean(self.phys["inside"]), _mean(self.phys["outside"])
+        f_in, f_out = _mean(self.f["inside"]), _mean(self.f["outside"])
+
+        tail_in = tail_out = np.nan
+        if method in ("scaled", "volume_corrected_scaled"):
+            inside, tail_in = _apply_tail_normalization(inside, normalize_tail_bins)
+            outside, tail_out = _apply_tail_normalization(outside, normalize_tail_bins)
+
+        rho_in, rho_out = _m(self.rho["inside"]), _m(self.rho["outside"])
+        cut_in = _find_first_minimum_after_first_peak(self.r, inside_phys) if inside_phys is not None else np.nan
+        cut_out = _find_first_minimum_after_first_peak(self.r, outside_phys) if outside_phys is not None else np.nan
+
+        meta = {
+            "n_frames_inside": len(self.curves["inside"]),
+            "n_frames_outside": len(self.curves["outside"]),
+            "V_in": _m(self.volume["inside"]), "V_in_std": _sd(self.volume["inside"]),
+            "V_out": _m(self.volume["outside"]), "V_out_std": _sd(self.volume["outside"]),
+            "n_in": _m(self.count["inside"]), "n_in_std": _sd(self.count["inside"]),
+            "n_out": _m(self.count["outside"]), "n_out_std": _sd(self.count["outside"]),
+            "rho_in": rho_in, "rho_in_std": _sd(self.rho["inside"]),
+            "rho_out": rho_out, "rho_out_std": _sd(self.rho["outside"]),
+            "rho_box_in": _m(self.rho_box["inside"]),
+            "rho_box_out": _m(self.rho_box["outside"]),
+            "rdf_tail_normalized": method in ("scaled", "volume_corrected_scaled"),
+            "rdf_tail_bins": normalize_tail_bins,
+            "rdf_tail_factor_inside": tail_in,
+            "rdf_tail_factor_outside": tail_out,
+            "Z_inside": _coordination_number_from_gr(self.r, inside_phys, rho_in, r_cut=cut_in),
+            "Z_outside": _coordination_number_from_gr(self.r, outside_phys, rho_out, r_cut=cut_out),
+            "Z_cut_inside": cut_in,
+            "Z_cut_outside": cut_out,
+            "Z_inside_frames_mean": _m(self.Z["inside"]),
+            "Z_inside_frames_std": _sd(self.Z["inside"]),
+            "Z_outside_frames_mean": _m(self.Z["outside"]),
+            "Z_outside_frames_std": _sd(self.Z["outside"]),
+            "Z_cut_inside_frames_mean": _m(self.Z_cut["inside"]),
+            "Z_cut_outside_frames_mean": _m(self.Z_cut["outside"]),
+            "rand_uniform_factor": (RAND_UNIFORM_FACTOR if method == "rand_uniform_corrected" else np.nan),
+            "interface_f_min": (INTERFACE_F_MIN if method in ("interface_corrected", "rand_uniform_corrected") else np.nan),
+            "interface_f_at_cut_inside": (float(np.interp(cut_in, self.r, f_in))
+                                          if f_in is not None and np.isfinite(cut_in) else np.nan),
+            "interface_f_at_cut_outside": (float(np.interp(cut_out, self.r, f_out))
+                                           if f_out is not None and np.isfinite(cut_out) else np.nan),
+        }
+        return {"r": self.r, "inside": inside, "outside": outside, "meta": meta,
+                "f_inside": f_in, "f_outside": f_out}
+
+
+def _pair_meta(meta, first, species_id, center_species_id, center_counts):
+    """Extra summary entries for a pair RDF g_{center -> species}."""
+    if center_species_id is None:
+        return {"pair_rdf": False}
+    out = {
+        "pair_rdf": True,
+        "center_species_id": int(center_species_id),
+        "center_species_name": typeid_to_name(first, int(center_species_id)),
+    }
+    for region, tag in (("inside", "in"), ("outside", "out")):
+        n_c = float(np.mean(center_counts[region])) if center_counts[region] else np.nan
+        n_n = meta.get(f"n_{tag}", np.nan)
+        z = meta.get(f"Z_{region}", np.nan)
+        out[f"n_center_{tag}"] = n_c
+        out[f"n_center_{tag}_std"] = float(np.std(center_counts[region])) if center_counts[region] else np.nan
+        # Z_{2->1} = Z_{1->2} * rho_1 / rho_2 (same region volume)
+        out[f"Z_{region}_reverse"] = (z * n_c / n_n
+                                      if np.isfinite(z) and np.isfinite(n_c) and n_n else np.nan)
+    return out
+
+
+def compute_rdf_inout_droplet(
+    traj_file,
+    species_id,
+    region_cache,
+    frame_indices=None,
+    method="freud",
+    rdf_bins=100,
+    r_max=5.0,
+    normalize_tail_bins=10,
+    use_buffer=False,
+    center_species_id=None,
+):
+    """
+    Inside/outside RDF for a droplet, region by region, frame by frame.
+
+    The regions come from the 3D density analysis (analyze_density_3d with a
+    region_cache): in each frame the INSIDE region is the reference species'
+    filled isosurface blob, with V_in its volume and the particles whose
+    centre falls in a blob voxel; the OUTSIDE region is its complement,
+    V_out = V_box - V_in, with every other particle of the species.  With
+    use_buffer=True, a shell of buffer voxels around the blob is
+    left out of the outside region (and of V_out), the droplet analogue of the
+    slab's transition buffer; the default 0 is the plain complement.
+
+    Fixed polymers never enter: their types are not RDF species, and their
+    beads are not points of either region.
+
+    freud.density.RDF is computed on each region's points in the full periodic
+    box, exactly as the slab RDF does, so both geometries normalise the same
+    way for every method.
+    """
+    if method not in RDF_METHODS:
+        raise ValueError("method must be one of: " + ", ".join(sorted(RDF_METHODS)))
+
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+    species_id = int(species_id)
+    cross = center_species_id is not None
+    min_pts = 1 if cross else 2
+    center_counts = {"inside": [], "outside": []}
+    if frame_indices is None:
+        frame_indices = sorted(region_cache)
+    frame_indices = [int(i) for i in frame_indices if int(i) in region_cache]
+    if not frame_indices:
+        return None
+
+    acc = _RDFAccumulator()
+    reference_species = None
+    voxel_volume = np.nan
+    buffer_voxels_used, buffer_nm_used = [], []
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+        for index in tqdm(frame_indices, desc=f"RDF droplet type={species_id}", leave=False):
+            cached = region_cache[index]
+            mask = cached["mask"]
+            if mask is None or not np.any(mask):
+                continue                         # no condensate this frame
+            reference_species = cached["reference_species"]
+            if species_id in cached["polymer_typeids"] or (
+                cross and int(center_species_id) in cached["polymer_typeids"]
+            ):
+                return None                      # a fixed polymer is never an RDF species
+
+            frame = traj[index]
+            frame_box = frame.configuration.box
+            freud_box = make_freud_box(frame)
+            L = cached["box_lengths"]
+            V_box = float(np.prod(L))
+
+            centers = cached["centers"]
+            steps = [float(np.mean(np.diff(np.asarray(c, dtype=float)))) for c in centers]
+            voxel_volume = float(np.prod(steps))
+
+            n_buf = 0
+            if use_buffer:
+                axes_used = cached["buffer_axes"] or [0, 1, 2]
+                per_axis = {a: cached["buffers_nm"][a] / steps[a] for a in axes_used}
+                a_max = max(per_axis, key=per_axis.get)
+                n_buf = int(np.ceil(per_axis[a_max] - 1e-9))
+                buffer_voxels_used.append(n_buf)
+                buffer_nm_used.append(cached["buffers_nm"][a_max])
+
+            outside_mask = ~mask
+            if n_buf:
+                from scipy import ndimage
+                padded = np.pad(mask, n_buf, mode="wrap")      # periodic images within n_buf voxels
+                dist = ndimage.distance_transform_edt(~padded)[n_buf:-n_buf, n_buf:-n_buf, n_buf:-n_buf]
+                outside_mask = ~(dist <= n_buf)
+            # Use the next 3 lines if instead of padding a sphere of length n_buf, we want to pad n_buf only along each axis (giving a smaller 3d diagonal length)
+            #   grown = ndimage.binary_dilation(
+            #         padded, ndimage.generate_binary_structure(3, 1), iterations=n_buf,
+            #   )[n_buf:-n_buf, n_buf:-n_buf, n_buf:-n_buf]
+            #   outside_mask = ~grown
+
+            V_in = float(cached["inside_volume_nm3"])
+            if not np.isfinite(V_in):
+                V_in = float(np.count_nonzero(mask)) * voxel_volume
+            V_out = (V_box - V_in) if not n_buf else (
+                float(np.count_nonzero(outside_mask)) * voxel_volume
+            )
+
+            species_mask = cached["typeids"] == species_id
+            sp_pos = cached["positions"][species_mask]
+            if sp_pos.shape[0] < min_pts:
+                continue
+
+            in_region = voxel_lookup(sp_pos, mask, centers)
+            out_region = voxel_lookup(sp_pos, outside_mask, centers)
+
+            center_sel = {}
+            if cross:
+                c_pos = cached["positions"][cached["typeids"] == int(center_species_id)]
+                center_sel = {"inside": voxel_lookup(c_pos, mask, centers),
+                              "outside": voxel_lookup(c_pos, outside_mask, centers)}
+
+            for region, sel, V_region, region_mask in (("inside", in_region, V_in, mask), ("outside", out_region, V_out, outside_mask)):
+                if np.count_nonzero(sel) < min_pts:
+                    continue
+                pts = sp_pos[sel]
+                query_pts = None
+                if cross:
+                    query_pts = c_pos[center_sel[region]]
+                    if query_pts.shape[0] == 0:
+                        continue
+                    center_counts[region].append(int(query_pts.shape[0]))
+                overlap = None
+                if method == "interface_corrected":
+                    overlap = (lambda rr, m=region_mask:
+                               region_overlap_fraction_mask(m, steps, rr))
+                random_points = None
+                if method == "rand_uniform_corrected":
+                    rng = np.random.default_rng(RAND_UNIFORM_SEED + int(index))
+                    random_points = (lambda n, m=region_mask, g=rng:
+                                     random_points_in_mask(m, centers, L, n, g))
+                curve = _rdf_region_curve(frame_box, freud_box, pts, V_region, V_box,
+                                          method, rdf_bins, r_max, overlap=overlap,
+                                          random_points=random_points, query_pts=query_pts)
+                acc.add(region, curve, V_region, pts.shape[0])
+
+    if acc.empty():
+        return None
+
+    res = acc.result(method, normalize_tail_bins)
+    res["meta"] = {
+        "trajname": trajname,
+        "kT_kJ_per_mol": kT,
+        "geometry": "droplet",
+        "species_id": species_id,
+        "species_name": typeid_to_name(first, species_id),
+        "reference_species_id": reference_species,
+        "reference_species_name": (
+            typeid_to_name(first, reference_species) if reference_species is not None else ""
+        ),
+        "method": method,
+        "region_definition": "filled isosurface of the reference species; outside = complement"
+                             + (" minus the transition-buffer shell" if use_buffer else ""),
+        "use_buffer": bool(use_buffer),
+        "outside_buffer_voxels": float(np.mean(buffer_voxels_used)) if buffer_voxels_used else 0.0,
+        "outside_buffer_voxels_max": int(max(buffer_voxels_used)) if buffer_voxels_used else 0,
+        "outside_buffer_nm": float(np.mean(buffer_nm_used)) if buffer_nm_used else 0.0,
+        "voxel_volume_nm3": voxel_volume,
+        "first_frame_analysed": frame_indices[0],
+        "last_frame_analysed": frame_indices[-1],
+        "n_frames_window": len(frame_indices),
+        "rdf_bins": rdf_bins,
+        "r_max": r_max,
+        "V_box": float(np.prod(region_cache[frame_indices[-1]]["box_lengths"])),
+        **res["meta"],
+        **_pair_meta(res["meta"], first, species_id, center_species_id, center_counts),
+    }
+    return res
+
+
+def compute_rdf_inout(
+    traj_file,
+    species_id,
+    reference_species_id=None,
+    method="freud",
+    top_percentage=0.75,
+    n_bins_density=200,
+    rdf_bins=100,
+    r_max=5.0,
+    transition_buffer=10,
+    smooth_window=9,
+    normalize_tail_bins=10,
+    prepare_config=None,
+    last_frames=None,
+    recenter=False,
+    center_species_id=None,
+):
+    """
+    Compute inside/outside RDF for one trajectory (slab geometry).
+
+    last_frames=N uses exactly the final N frames, both for the density
+    profile that sets x_in_min, x_in_max, buffer_min and buffer_max and for
+    the RDF itself, instead of the top_percentage window.
+
+    Condensate region is detected using reference_species_id.
+
+    The default method, "freud", uses freud.density.RDF with Freud's built-in
+    normalization only: no density re-scaling, volume correction, tail scaling,
+    or manual histogramming.  The optional methods reproduce the reference code
+    normalization variants: raw, scaled, volume_corrected,
+    volume_corrected_scaled, density_normalized, freud_finite_size, and
+    freud_histogram.
+    """
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+
+    if method not in RDF_METHODS:
+        raise ValueError(
+            "method must be one of: " + ", ".join(sorted(RDF_METHODS))
+        )
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+
+        if reference_species_id is None:
+            reference_species_id = default_reference_species(first, prepare_config=prepare_config)
+
+        reference_species_id = int(reference_species_id)
+        species_id = int(species_id)
+        cross = center_species_id is not None
+        min_pts = 1 if cross else 2
+        center_counts = {"inside": [], "outside": []}
+
+        n_frames = len(traj)
+        start_frame, end_frame = density3d_frame_range(
+            n_frames, top_percentage, last_frames=last_frames
+        )
+
+        frame0 = traj[start_frame]
+        Lx, Ly, Lz = frame0.configuration.box[:3]
+        V_box = Lx * Ly * Lz
+        x_box_min, x_box_max = -Lx / 2, Lx / 2
+
+        per_frame_bounds = last_frames is not None
+        fixed_bounds = None
+        if not per_frame_bounds:
+            # One profile averaged over the top_percentage window sets the bounds.
+            df_ref_density = compute_number_density_profile(
+                traj,
+                species_id=reference_species_id,
+                top_percentage=top_percentage,
+                n_bins=n_bins_density,
+                last_frames=None,
+                recenter_species=reference_species_id if recenter else None,
+            )
+            if df_ref_density is None:
+                return None
+            (
+                ref_low, ref_high, x_in_min, x_in_max,
+                box_left, box_right, buffer_min, buffer_max,
+            ) = calculate_low_high_avg_v2(
+                df_ref_density,
+                transition_buffer=transition_buffer,
+                smooth_window=smooth_window,
+            )
+            if x_in_min is None or x_in_max is None:
+                return None
+            fixed_bounds = (x_in_min, x_in_max, buffer_min, buffer_max)
+
+        acc = _RDFAccumulator()
+        bounds_used = []
+        n_bounds_failed = 0
+
+        for i in tqdm(range(start_frame, end_frame), desc=f"RDF type={species_id}", leave=False):
+            frame = traj[i]
+            box = make_freud_box(frame)
+
+            shift = slab_x_shift(frame, reference_species_id) if recenter else 0.0
+            if per_frame_bounds:
+                bounds = slab_bounds_one_frame(
+                    frame, reference_species_id, n_bins_density,
+                    transition_buffer, smooth_window, shift=shift,
+                )
+                if bounds is None:
+                    n_bounds_failed += 1
+                    continue
+            else:
+                bounds = fixed_bounds
+            x_in_min, x_in_max, buffer_min, buffer_max = bounds
+            bounds_used.append(bounds)
+
+            V_in = max(0.0, x_in_max - x_in_min) * Ly * Lz
+            V_out = (
+                max(0.0, buffer_min - x_box_min)
+                + max(0.0, x_box_max - buffer_max)
+            ) * Ly * Lz
+
+            # This frame's regions along x (in the same coordinates as x_sel),
+            # for the selection, the overlap fraction and the random points.
+            slab_region = {
+                "inside": lambda x, a=x_in_min, b=x_in_max: (x >= a) & (x <= b),
+                "outside": lambda x, a=buffer_min, b=buffer_max: (x < a) | (x > b),
+            }
+            slab_overlap = {
+                key: (lambda rr, reg=reg: region_overlap_fraction_slab(reg, Lx, rr))
+                for key, reg in slab_region.items()
+            }
+
+            pos = np.asarray(frame.particles.position, dtype=float)
+            tid = np.asarray(frame.particles.typeid, dtype=int)
+            sp_pos = pos[tid == species_id]
+
+            if sp_pos.shape[0] < min_pts:
+                continue
+
+            x_sel = sp_pos[:, 0]
+            if recenter:
+                x_sel = _wrap_to_box(x_sel - shift, Lx)
+
+            inside_mask = slab_region["inside"](x_sel)
+            outside_mask = slab_region["outside"](x_sel)
+
+            center_sel = {}
+            if cross:
+                c_pos = pos[tid == int(center_species_id)]
+                c_x = _wrap_to_box(c_pos[:, 0] - shift, Lx) if recenter else c_pos[:, 0]
+                center_sel = {"inside": slab_region["inside"](c_x),
+                              "outside": slab_region["outside"](c_x)}
+
+            for region, mask, V_region in (("inside", inside_mask, V_in), ("outside", outside_mask, V_out)):
+                if np.sum(mask) < min_pts:
+                    continue
+                pts = sp_pos[mask]
+                query_pts = None
+                if cross:
+                    query_pts = c_pos[center_sel[region]]
+                    if query_pts.shape[0] == 0:
+                        continue
+                    center_counts[region].append(int(query_pts.shape[0]))
+                rng = np.random.default_rng(RAND_UNIFORM_SEED + int(i))
+                random_points = (lambda n, reg=slab_region[region], g=rng:
+                                 random_points_in_slab(reg, (Lx, Ly, Lz), n, g))
+                curve = _rdf_region_curve(frame.configuration.box, box, pts, V_region, V_box,
+                                          method, rdf_bins, r_max, overlap=slab_overlap[region],
+                                          random_points=random_points, query_pts=query_pts)
+                acc.add(region, curve, V_region, pts.shape[0])
+
+        if acc.empty():
+            return None
+
+        b = np.asarray(bounds_used, dtype=float)
+
+        res = acc.result(method, normalize_tail_bins)
+        res["meta"] = {
+            "trajname": trajname,
+            "kT_kJ_per_mol": kT,
+            "geometry": "slab",
+            "bounds_per_frame": bool(per_frame_bounds),
+            "n_frames_bounds_failed": int(n_bounds_failed),
+            "species_id": species_id,
+            "species_name": typeid_to_name(first, species_id),
+            "reference_species_id": reference_species_id,
+            "reference_species_name": typeid_to_name(first, reference_species_id),
+            "method": method,
+            "top_percentage": top_percentage,
+            "last_frames": last_frames if last_frames is not None else np.nan,
+            "recentered": bool(recenter),
+            "first_frame_analysed": start_frame,
+            "last_frame_analysed": end_frame - 1,
+            "n_frames_window": end_frame - start_frame,
+            "n_bins_density": n_bins_density,
+            "rdf_bins": rdf_bins,
+            "r_max": r_max,
+            "V_box": V_box,
+            **res["meta"],
+            "x_in_min": float(b[:, 0].mean()), "x_in_min_std": float(b[:, 0].std()),
+            "x_in_max": float(b[:, 1].mean()), "x_in_max_std": float(b[:, 1].std()),
+            "buffer_min": float(b[:, 2].mean()), "buffer_min_std": float(b[:, 2].std()),
+            "buffer_max": float(b[:, 3].mean()), "buffer_max_std": float(b[:, 3].std()),
+            "x_width": float((b[:, 1] - b[:, 0]).mean()), "x_width_std": float((b[:, 1] - b[:, 0]).std()),
+            **_pair_meta(res["meta"], first, species_id, center_species_id, center_counts),
+        }
+        return res
+
+
+def compute_rdf_bulk(
+    traj_file,
+    species_id,
+    method="freud",
+    top_percentage=0.75,
+    rdf_bins=100,
+    r_max=5.0,
+    normalize_tail_bins=10,
+    last_frames=None,
+    center_species_id=None,
+):
+    """
+    RDF of a single homogeneous phase: the whole periodic box is the region.
+
+    There is no boundary, so V_region = V_box, f(r) = 1 and every
+    normalisation method reduces to the plain region-density g(r).  The
+    curve is stored as "inside"; "outside" is left empty.  Frames come from
+    last_frames, or the top_percentage window.  center_species_id gives the
+    pair RDF g_{center -> species_id} as for the two-region geometries.
+    """
+    if method not in RDF_METHODS:
+        raise ValueError("method must be one of: " + ", ".join(sorted(RDF_METHODS)))
+
+    trajname = get_trajname(traj_file)
+    kT = extract_kT_from_filename(traj_file)
+    species_id = int(species_id)
+    cross = center_species_id is not None
+    min_pts = 1 if cross else 2
+    center_counts = {"inside": [], "outside": []}
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+        n_frames = len(traj)
+        start_frame, end_frame = density3d_frame_range(n_frames, top_percentage, last_frames=last_frames)
+        acc = _RDFAccumulator()
+        for i in tqdm(range(start_frame, end_frame), desc=f"RDF bulk type={species_id}", leave=False):
+            frame = traj[i]
+            box = make_freud_box(frame)
+            L = np.asarray(frame.configuration.box[:3], dtype=float)
+            V_box = float(np.prod(L))
+            pos = np.asarray(frame.particles.position, dtype=float)
+            tid = np.asarray(frame.particles.typeid, dtype=int)
+            pts = pos[tid == species_id]
+            if pts.shape[0] < min_pts:
+                continue
+            query_pts = None
+            if cross:
+                query_pts = pos[tid == int(center_species_id)]
+                if query_pts.shape[0] == 0:
+                    continue
+                center_counts["inside"].append(int(query_pts.shape[0]))
+            rng = np.random.default_rng(RAND_UNIFORM_SEED + int(i))
+            random_points = (lambda n, g=rng, L=L:
+                             (g.random((int(n), 3)) * L - L / 2.0).astype(np.float32))
+            curve = _rdf_region_curve(
+                frame.configuration.box, box, pts, V_box, V_box, method, rdf_bins, r_max,
+                overlap=lambda rr: np.ones_like(np.asarray(rr, dtype=float)),
+                random_points=random_points, query_pts=query_pts,
+            )
+            acc.add("inside", curve, V_box, pts.shape[0])
+
+    if acc.empty():
+        return None
+    res = acc.result(method, normalize_tail_bins)
+    res["meta"] = {
+        "trajname": trajname,
+        "kT_kJ_per_mol": kT,
+        "geometry": "bulk",
+        "species_id": species_id,
+        "species_name": typeid_to_name(first, species_id),
+        "reference_species_id": np.nan,
+        "reference_species_name": "",
+        "method": method,
+        "region_definition": "whole box (single phase)",
+        "top_percentage": top_percentage,
+        "last_frames": last_frames if last_frames is not None else np.nan,
+        "first_frame_analysed": start_frame,
+        "last_frame_analysed": end_frame - 1,
+        "n_frames_window": end_frame - start_frame,
+        "rdf_bins": rdf_bins,
+        "r_max": r_max,
+        **res["meta"],
+        **_pair_meta(res["meta"], first, species_id, center_species_id, center_counts),
+    }
+    return res
+
+
+def rdf_geometry_from_prepare(prepare_config):
+    """'droplet' for droplet-type BOX.simulation_geometry values, else 'slab'."""
+    try:
+        geometry = str((prepare_config or {})["BOX"]["simulation_geometry"]).lower()
+    except (KeyError, TypeError):
+        return "slab"
+    return "droplet" if ("droplet" in geometry or geometry == "constant_vf") else "slab"
+
+
+def analyze_rdf(
+    traj_file,
+    species_ids=None,
+    reference_species=None,
+    method="freud",
+    top_percentage=0.75,
+    n_bins_density=200,
+    rdf_bins=100,
+    r_max=5.0,
+    transition_buffer=10,
+    smooth_window=9,
+    normalize_tail_bins=10,
+    output_dir=".",
+    plot=False,
+    prepare_config=None,
+    geometry="auto",
+    last_frames=None,
+    region_cache=None,
+    use_buffer=False,
+    recenter_slab=False,
+    pairs=None,
+):
+    """
+    Inside/outside RDFs, written per species.
+
+    geometry="slab": the original 1D detection along x (unchanged), over the
+    top_percentage window or, with last_frames, the final N frames.
+    geometry="droplet": regions from the 3D analysis' filled isosurface,
+    frame by frame; needs region_cache filled by analyze_density_3d for the
+    frames to analyse.  geometry="auto" picks droplet when prepare.py's
+    BOX.simulation_geometry is a droplet geometry, slab otherwise.
+    """
+    ensure_dir(output_dir)
+    trajname = get_trajname(traj_file)
+
+    if geometry == "auto":
+        geometry = rdf_geometry_from_prepare(prepare_config)
+    if geometry not in ("slab", "droplet", "bulk"):
+        raise ValueError(f"geometry must be 'slab', 'droplet', 'bulk' or 'auto', got {geometry!r}")
+
+    outputs = []
+    polymer_types = set()
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+
+        if geometry == "droplet":
+            if not region_cache:
+                print("Droplet RDF skipped: no condensate regions available "
+                      "(run with the 3D density analysis, or pass region_cache).")
+                return outputs
+            any_cached = region_cache[sorted(region_cache)[0]]
+            polymer_types = set(any_cached["polymer_typeids"])
+            if reference_species is None:
+                reference_species = any_cached["reference_species"]
+            elif int(reference_species) != int(any_cached["reference_species"]):
+                print(
+                    f"Note: droplet regions were found for reference species "
+                    f"{any_cached['reference_species']}, not {reference_species}; using those."
+                )
+                reference_species = any_cached["reference_species"]
+
+        if species_ids is None:
+            species_ids = [
+                reference_species if reference_species is not None
+                else default_reference_species(first, prepare_config=prepare_config)
+            ]
+
+        if reference_species is None:
+            reference_species = default_reference_species(first, prepare_config=prepare_config)
+
+    dropped = [s for s in species_ids if int(s) in polymer_types]
+    if dropped:
+        print(f"RDF ignores fixed-polymer types: {dropped}")
+    species_ids = [s for s in species_ids if int(s) not in polymer_types]
+    print(f"RDF geometry: {geometry}")
+
+    if pairs:
+        jobs = [(int(b), int(a)) for a, b in pairs
+                if int(a) not in polymer_types and int(b) not in polymer_types]
+        if len(jobs) < len(pairs):
+            print("RDF ignores pairs that involve fixed-polymer types.")
+    else:
+        jobs = [(int(s), None) for s in species_ids]
+
+    for species_id, center_id in jobs:
+        if geometry == "bulk":
+            res = compute_rdf_bulk(
+                traj_file,
+                species_id=species_id,
+                method=method,
+                top_percentage=top_percentage,
+                rdf_bins=rdf_bins,
+                r_max=r_max,
+                normalize_tail_bins=normalize_tail_bins,
+                last_frames=last_frames,
+                center_species_id=center_id,
+            )
+        elif geometry == "droplet":
+            frames = sorted(region_cache)
+            if last_frames is not None:
+                frames = frames[-int(last_frames):]
+            res = compute_rdf_inout_droplet(
+                traj_file,
+                species_id=species_id,
+                region_cache=region_cache,
+                frame_indices=frames,
+                method=method,
+                rdf_bins=rdf_bins,
+                r_max=r_max,
+                normalize_tail_bins=normalize_tail_bins,
+                use_buffer=use_buffer,
+                center_species_id=center_id,
+            )
+        else:
+            res = compute_rdf_inout(
+                traj_file,
+                species_id=species_id,
+                reference_species_id=reference_species,
+                method=method,
+                top_percentage=top_percentage,
+                n_bins_density=n_bins_density,
+                rdf_bins=rdf_bins,
+                r_max=r_max,
+                transition_buffer=transition_buffer,
+                smooth_window=smooth_window,
+                normalize_tail_bins=normalize_tail_bins,
+                prepare_config=prepare_config,
+                last_frames=last_frames,
+                recenter=recenter_slab,
+                center_species_id=center_id,
+            )
+
+        if res is None:
+            print(f"Skipping RDF for species {species_id}: no usable RDF result.")
+            continue
+
+        meta = res["meta"]
+        species_tag = f"type_{species_id}_{safe_name(meta['species_name'])}"
+        rdf_label = meta["species_name"]
+        if center_id is not None:
+            species_tag = (f"type_{center_id}_{safe_name(meta['center_species_name'])}"
+                           f"_to_{species_tag}")
+            rdf_label = f"{meta['center_species_name']} -> {meta['species_name']}"
+        method_tag = safe_name(method)
+
+        rdf_df = pd.DataFrame({"r_nm": res["r"]})
+
+        if res["inside"] is not None:
+            rdf_df["inside"] = res["inside"]
+        else:
+            rdf_df["inside"] = np.nan
+
+        if res["outside"] is not None:
+            rdf_df["outside"] = res["outside"]
+        else:
+            rdf_df["outside"] = np.nan
+
+        for key in ("f_inside", "f_outside"):
+            if res.get(key) is not None:
+                rdf_df[key] = res[key]
+
+        for key in ["trajname", "kT_kJ_per_mol", "geometry", "species_id", "species_name", "method"]:
+            rdf_df[key] = meta[key]
+
+        summary_df = pd.DataFrame([meta])
+
+        rdf_csv = os.path.join(output_dir, f"{trajname}_{species_tag}_rdf_{method_tag}.csv")
+        summary_csv = os.path.join(output_dir, f"{trajname}_{species_tag}_rdf_{method_tag}_summary.csv")
+
+        rdf_df = add_hoomd_unit_metadata(rdf_df, prepare_config=prepare_config)
+        summary_df = add_hoomd_unit_metadata(summary_df, prepare_config=prepare_config)
+
+        rdf_df.to_csv(rdf_csv, index=False)
+        summary_df.to_csv(summary_csv, index=False)
+
+        if plot:
+            fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+
+            if res["inside"] is not None:
+                ax.plot(res["r"], res["inside"], label="Inside condensate")
+
+            if res["outside"] is not None:
+                ax.plot(res["r"], res["outside"], label="Outside condensate")
+
+            if method != "freud_histogram":
+                ax.axhline(1.0, linestyle="--", color="gray", lw=1)
+
+            z_lines = []
+            if np.isfinite(meta.get("Z_inside", np.nan)):
+                z_lines.append(f"Z_in = {meta['Z_inside']:.3g} (r_c={meta.get('Z_cut_inside', np.nan):.3g})")
+            if np.isfinite(meta.get("Z_outside", np.nan)):
+                z_lines.append(f"Z_out = {meta['Z_outside']:.3g} (r_c={meta.get('Z_cut_outside', np.nan):.3g})")
+            if z_lines:
+                ax.text(
+                    0.98,
+                    0.98,
+                    "\n".join(z_lines),
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+                )
+
+            ax.set_xlabel(f"r [{unit_label('length', prepare_config)}]")
+            ax.set_ylabel("distance histogram [counts]" if method == "freud_histogram" else "g(r)")
+            ax.set_title(f"{trajname}: RDF {rdf_label} ({method}, {meta['geometry']})")
+            ax.grid(alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+
+            svg_path = os.path.join(output_dir, f"{trajname}_{species_tag}_rdf_{method_tag}.svg")
+            fig.savefig(svg_path, bbox_inches="tight")
+            plt.close(fig)
+
+        outputs.append((rdf_df, summary_df))
+
+    return outputs
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def build_argparser():
+    parser = argparse.ArgumentParser(
+        description="Analyze one HOOMD/GSD trajectory."
+    )
+
+    parser.add_argument("traj_file", help="Input trajectory GSD file.")
+    parser.add_argument("--output-dir", default=".", help="Directory for output CSV/SVG files.")
+    parser.add_argument("--plot", action="store_true", help="Save plots as SVG.")
+    parser.add_argument("--plot-isosurface", action="store_true", help="Plot the 3D filled isosurface; only used for a droplet geometry.")
+
+    parser.add_argument("--prepare-file", default=None, help="Path to prepare.py. Default: auto-detect next to the trajectory or analysis.py.")
+    parser.add_argument("--dt", type=float, default=None, help="Override simulation timestep dt for time axes. Default: TIME[\"dt\"] from prepare.py, else 0.001.")
+
+    parser.add_argument("--top-percentage", type=float, default=0.25, help="Final trajectory fraction used for density/RDF.")
+    parser.add_argument("--density-bins", type=int, default=100, help="Number of bins for density profile.")
+    parser.add_argument("--rdf-density-bins", type=int, default=200, help="Number of bins for RDF condensate detection.")
+    parser.add_argument("--transition-buffer", type=float, default=10.0, help="Buffer around dense region.")
+    parser.add_argument("--smooth-window", type=int, default=9, help="Density smoothing window.")
+
+    parser.add_argument("--density-last-frames", type=int, default=10, help="Use exactly the last N frames for the 1D slab density analysis (overrides --top-percentage there).")
+    parser.add_argument("--density-per-frame", action="store_true", help="1D slab: recenter each frame on the reference species, re-detect the slab in every frame and report the mean/std of the per-frame dense and dilute VF.")
+    parser.add_argument("--density-species", nargs="*", default=None, help="Species/type IDs or names for density. Default: all types.")
+    parser.add_argument("--reference-species", default=None, help="Reference type ID/name for condensate detection. Default: first core type.")
+
+    parser.add_argument("--bond-type1", default=None, help="Bond type 1 ID/name.")
+    parser.add_argument("--bond-type2", default=None, help="Bond type 2 ID/name.")
+    parser.add_argument("--bond-dist", type=float, default=None, help="Bond cutoff distance.")
+    parser.add_argument("--bond-stepper", type=int, default=1, help="Analyze every Nth frame for bonds.")
+    parser.add_argument("--bond-tail-fraction", type=float, default=0.25, help="Tail fraction for bond averages. Default: last 25% of data.")
+    parser.add_argument("--no-auto-bonds", action="store_true", help="Do not auto-detect patch-patch bond analysis.")
+
+    parser.add_argument("--msd-species", nargs="*", default=None, help="Species/type IDs or names for MSD. Default: first core type.")
+    parser.add_argument(
+        "--msd-method",
+        default="freud_window",
+        choices=[
+            "freud_direct",
+            "freud_window",
+            "manual_direct",
+            "manual_window",
+            "manual",
+            "numpy",
+            "numpy_direct",
+            "numpy_window",
+        ],
+        help=(
+            "MSD method. Default: freud_window uses freud.msd.MSD(box, mode='window') "
+            "with the last-frame box. manual_direct/manual_window use NumPy and unwrap "
+            "positions using HOOMD image vectors and each frame's box."
+        ),
+    )
+    parser.add_argument("--freud-direct", action="store_true", help="Shortcut for --msd-method freud_direct.")
+
+    parser.add_argument("--rdf-species", nargs="*", default=None, help="Species/type IDs or names for RDF. Default: first core type.")
+    parser.add_argument("--rdf-pairs", nargs="*", default=None, metavar="A:B",
+                        help="Pair RDFs g_{A->B}: B neighbours counted around A particles, e.g. 0:1 or A_core:B_core. Replaces --rdf-species when given.")
+    parser.add_argument("--rdf-method", default="freud",
+                        choices=["freud", "freud_histogram", "raw", "scaled", "volume_corrected", "volume_corrected_scaled", "density_normalized", "freud_finite_size", "interface_corrected", "rand_uniform_corrected"],
+                        help="RDF method. Default 'freud' uses only freud.density.RDF built-in normalization.")
+    parser.add_argument("--rdf-bins", type=int, default=100, help="Number of RDF bins.")
+    parser.add_argument("--rdf-r-max", type=float, default=5.0, help="Maximum RDF radius.")
+    parser.add_argument("--rdf-geometry", default="auto", choices=["auto", "slab", "droplet", "bulk"],
+                        help="RDF region geometry. auto: droplet if prepare.py's BOX.simulation_geometry is a droplet geometry, else slab; never picks bulk. bulk: the whole box is one homogeneous phase (no inside/outside split).")
+    parser.add_argument("--rdf-last-frames", type=int, default=None,
+                        help="Use exactly the last N frames for the RDF (and, for slabs, calculate the region detection per frame!) instead of --top-percentage. Droplets default to the 3D analysis window.")
+    parser.add_argument("--rdf-recenter", action="store_true",
+                        help="Slab RDF: recentre every frame on the reference species along x before detecting and applying the region bounds.")
+    parser.add_argument("--rdf-buffer", action="store_true",
+                        help="Droplet RDF: leave the transition-buffer shell around the isosurface out of the outside region. Its thickness is the 3D analysis' transition buffer (--transition-buffer, capped by --density3d-buffer-fraction) converted to voxels.")
+    parser.add_argument("--rdf-tail-bins", type=int, default=10, help="Number of long-distance RDF bins used for tail normalization.")
+
+    density3d = parser.add_argument_group(
+        "3D density analysis (--density-3d)",
+        "Per-axis condensate detection plus a 3D Gaussian concentration field, run "
+        "separately for every populated core species found in the GSD. Patch types "
+        "are always excluded. Opt-in: existing runs are unchanged unless --density-3d "
+        "is passed.",
+    )
+    density3d.add_argument("--density-3d", action="store_true", help="Run the 3D density analysis.")
+    density3d.add_argument("--density3d-bins", type=int, default=None, help="Bins per axis for the 3D profiles. Default: --density-bins.")
+    density3d.add_argument("--density3d-per-frame", action="store_true", help="Deprecated and ignored: the 3D analysis is always per frame.")
+    density3d.add_argument("--density3d-plot-frame", type=int, default=None, help="Frame the 3D figures are made from. Default: the last analysed frame.")
+    density3d.add_argument("--density3d-last-frames", type=int, default=10, help="Use exactly the last N frames for the 3D density analysis (overrides --top-percentage there). Dense/dilute VF are computed per frame and their mean and std are written to the summary CSV.")
+    density3d.add_argument("--density3d-voxel", type=float, default=0.5, help="Target voxel edge length in nm for the concentration field.")
+    density3d.add_argument("--density3d-grid", type=int, default=None, help="Explicit cubic grid size, overriding --density3d-voxel.")
+    density3d.add_argument("--density3d-sigma", type=float, default=1.0, help="Gaussian smearing width in nm for the concentration field.")
+    density3d.add_argument("--density3d-frame", type=int, default=None, help="Trajectory frame for the 3D field. Default: last frame.")
+    density3d.add_argument("--density3d-frames", type=int, default=1, help="Average the field over this many frames ending at --density3d-frame.")
+    density3d.add_argument("--density3d-threshold-fraction", type=float, default=0.5, help="Color threshold as low + f*(high-low), from each species' own 1D profiles.")
+    density3d.add_argument("--density3d-min-contrast", type=float, default=1.5, help="Minimum dense/dilute ratio for an axis to count as phase separated.")
+    density3d.add_argument("--density3d-max-width", type=float, default=0.9, help="Reject a dense segment wider than this fraction of the box.")
+    density3d.add_argument("--density3d-buffer-fraction", type=float, default=0.1, help="Cap the transition buffer at this fraction of each box length.")
+    density3d.add_argument("--density3d-no-recenter", action="store_true", help="Do not recenter frames on the condensate center of mass.")
+    density3d.add_argument("--density3d-recenter-per-species", action="store_true", help="Detect and measure each species in a frame centered on its own center of mass. Use when two species form condensates that drift independently: the shared frame smears the non-reference one and dilutes its density. Figures stay in the reference frame.")
+    density3d.add_argument("--density3d-no-refine", action="store_true", help="Skip the transverse-restricted refinement pass.")
+    density3d.add_argument("--density3d-extend-to-threshold", action="store_true", help="Grow each condensate cuboid outward to where its profile crosses the color threshold. Fixes a cuboid inscribed in the condensate rather than matching it; may bias the dense density low if the interface is diffuse.")
+    density3d.add_argument("--density3d-shared-region", action="store_true", help="Measure every species inside the reference species' cuboid instead of its own.")
+    density3d.add_argument("--density3d-views", nargs="*", default=None, metavar="ELEV,AZIM", help="Viewpoints for the 3D renders, e.g. 20,45 20,135 65,45.")
+    density3d.add_argument("--density3d-max-points", type=int, default=60000, help="Cap on rendered above-threshold voxels per species.")
+    density3d.add_argument("--density3d-marker-size", type=float, default=5.0, help="Scatter marker size in the 3D renders.")
+    density3d.add_argument("--density3d-format", default="png", choices=["png", "svg", "both"], help="Raster or vector output for the 3D figures. PNG is strongly recommended for scatter renders.")
+    density3d.add_argument("--density3d-no-slices", action="store_true", help="Do not write the orthogonal slice figures.")
+    density3d.add_argument("--density3d-no-two-color", action="store_true", help="Do not write two-color comparison figures for pairs of core species.")
+    density3d.add_argument("--density3d-max-two-color-pairs", type=int, default=6, help="Cap on the number of core-species pairs rendered in two colors.")
+    density3d.add_argument("--density3d-plot-all-species", action="store_true", help="Render 3D figures even for core species with no detected condensate. Patch types remain excluded.")
+    density3d.add_argument("--density3d-rotate", action="store_true", help="Also write turntable GIFs of the 3D fields.")
+    density3d.add_argument("--density3d-interactive", action="store_true", help="Open rotatable windows of the 3D fields (needs a GUI backend).")
+    density3d.add_argument("--density3d-save-field", action="store_true", help="Save the raw concentration fields as .npz, one per species.")
+    density3d.add_argument("--skip-density-3d", action="store_true", help="Force-skip the 3D density analysis.")
+
+    parser.add_argument("--skip-observables", action="store_true")
+    parser.add_argument("--skip-density", action="store_true")
+    parser.add_argument("--skip-bonds", action="store_true")
+    parser.add_argument("--skip-msd", action="store_true")
+    parser.add_argument("--skip-rdf", action="store_true")
+    parser.add_argument("--droplet-detect", action="store_true")
+
+    return parser
+
+
+def main():
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    traj_file = args.traj_file
+    trajname = get_trajname(traj_file)
+
+    ensure_dir(args.output_dir)
+
+    prepare_config = load_prepare_config(path=args.prepare_file, traj_file=traj_file)
+    dt = float(args.dt) if args.dt is not None else get_dt_from_prepare(prepare_config, fallback=0.001)
+    msd_method = "freud_direct" if args.freud_direct else args.msd_method
+
+    with open_traj(traj_file) as traj:
+        first = traj[0]
+
+        density_species = None
+        if args.density_species is not None and len(args.density_species) > 0:
+            density_species = parse_type_specs(first, args.density_species)
+
+        msd_species = None
+        if args.msd_species is not None and len(args.msd_species) > 0:
+            msd_species = parse_type_specs(first, args.msd_species)
+
+        rdf_species = None
+        if args.rdf_species is not None and len(args.rdf_species) > 0:
+            rdf_species = parse_type_specs(first, args.rdf_species)
+        rdf_pairs = None
+        if args.rdf_pairs:
+            rdf_pairs = []
+            for spec in args.rdf_pairs:
+                a, b = spec.split(":")
+                rdf_pairs.append((parse_type_spec(first, a), parse_type_spec(first, b)))
+
+        reference_species = None
+        if args.reference_species is not None:
+            reference_species = parse_type_spec(first, args.reference_species)
+
+        bond_type1 = None
+        bond_type2 = None
+
+        if args.bond_type1 is not None:
+            bond_type1 = parse_type_spec(first, args.bond_type1)
+
+        if args.bond_type2 is not None:
+            bond_type2 = parse_type_spec(first, args.bond_type2)
+
+        print(f"Trajectory: {traj_file}")
+        print(f"Trajectory name: {trajname}")
+        print(f"Particle types: {get_type_names(first)}")
+        print(f"Output directory: {args.output_dir}")
+        print(f"prepare.py: {prepare_config['path'] if prepare_config['path'] else 'not found; using defaults'}")
+        print(f"dt: {dt} {unit_label('time', prepare_config)}/step")
+
+    if not args.skip_observables:
+        print("\n=== Observables ===")
+        analyze_observables(
+            traj_file,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            dt=dt,
+            prepare_config=prepare_config,
+        )
+
+    if not args.skip_density:
+        print("\n=== Density profile ===")
+        analyze_density_profile(
+            traj_file,
+            species_ids=density_species,
+            reference_species=reference_species,
+            n_bins=args.density_bins,
+            top_percentage=args.top_percentage,
+            transition_buffer=args.transition_buffer,
+            smooth_window=args.smooth_window,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            prepare_config=prepare_config,
+            last_frames=args.density_last_frames,
+            per_frame=args.density_per_frame,
+        )
+
+    rdf_geometry = args.rdf_geometry
+    if rdf_geometry == "auto":
+        rdf_geometry = rdf_geometry_from_prepare(prepare_config)
+    region_cache = {} if (not args.skip_rdf and rdf_geometry == "droplet") else None
+
+    def _run_density_3d(make_plots, cache):
+        return analyze_density_3d(
+            traj_file,
+            species_ids=density_species,
+            reference_species=reference_species,
+            n_bins=args.density3d_bins if args.density3d_bins else args.density_bins,
+            top_percentage=args.top_percentage,
+            last_frames=args.density3d_last_frames,
+            plot_frame=args.density3d_plot_frame,
+            transition_buffer=args.transition_buffer,
+            buffer_box_fraction=args.density3d_buffer_fraction,
+            smooth_window=args.smooth_window,
+            min_contrast=args.density3d_min_contrast,
+            max_width_fraction=args.density3d_max_width,
+            recenter=not args.density3d_no_recenter,
+            recenter_per_species=args.density3d_recenter_per_species,
+            refine=not args.density3d_no_refine,
+            extend_to_threshold=args.density3d_extend_to_threshold,
+            shared_region=args.density3d_shared_region,
+            voxel_nm=args.density3d_voxel,
+            grid=args.density3d_grid,
+            sigma_nm=args.density3d_sigma,
+            field_frame=args.density3d_frame,
+            field_frames=args.density3d_frames,
+            threshold_fraction=args.density3d_threshold_fraction,
+            max_points=args.density3d_max_points,
+            marker_size=args.density3d_marker_size,
+            views=parse_view_specs(args.density3d_views),
+            figure_format=args.density3d_format,
+            make_slices=not args.density3d_no_slices,
+            two_color=not args.density3d_no_two_color,
+            max_two_color_pairs=args.density3d_max_two_color_pairs,
+            plot_all_species=args.density3d_plot_all_species,
+            rotate_gif=args.density3d_rotate,
+            interactive=args.density3d_interactive,
+            save_field=args.density3d_save_field,
+            output_dir=args.output_dir,
+            plot=make_plots,
+            plot_isosurface_3d=args.plot_isosurface,
+            prepare_config=prepare_config,
+            region_cache=cache,
+        )
+
+    ran_density_3d = False
+    if args.density_3d and not args.skip_density_3d:
+        print("\n=== 3D density profile ===")
+        _run_density_3d(args.plot or args.density3d_interactive, region_cache)
+        ran_density_3d = True
+
+    if not args.skip_bonds:
+        print("\n=== Bonds ===")
+        analyze_bonds(
+            traj_file,
+            type_1=bond_type1,
+            type_2=bond_type2,
+            dist=args.bond_dist,
+            stepper=args.bond_stepper,
+            tail_fraction=args.bond_tail_fraction,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            auto_if_missing=not args.no_auto_bonds,
+            prepare_config=prepare_config,
+            dt=dt,
+        )
+
+    if not args.skip_msd:
+        print("\n=== MSD ===")
+        analyze_msd(
+            traj_file,
+            species_ids=msd_species,
+            dt=dt,
+            msd_method=msd_method,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            prepare_config=prepare_config,
+        )
+
+    if not args.skip_rdf:
+        print("\n=== RDF ===")
+        if rdf_geometry == "droplet" and not ran_density_3d:
+            # The droplet regions come from the 3D analysis; run it (without
+            # figures) with the same settings to obtain them.
+            print("Droplet RDF needs the 3D condensate regions; running the 3D density analysis first.")
+            _run_density_3d(False, region_cache)
+        analyze_rdf(
+            traj_file,
+            species_ids=rdf_species,
+            reference_species=reference_species,
+            method=args.rdf_method,
+            top_percentage=args.top_percentage,
+            n_bins_density=args.rdf_density_bins,
+            rdf_bins=args.rdf_bins,
+            r_max=args.rdf_r_max,
+            transition_buffer=args.transition_buffer,
+            smooth_window=args.smooth_window,
+            normalize_tail_bins=args.rdf_tail_bins,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            prepare_config=prepare_config,
+            geometry=rdf_geometry,
+            last_frames=args.rdf_last_frames,
+            region_cache=region_cache,
+            use_buffer=args.rdf_buffer,
+            recenter_slab=args.rdf_recenter,
+            pairs=rdf_pairs,
+        )
+
+    if args.droplet_detect:
+        print("\n=== Droplet detection ===")
+        result = detect_droplet_3d(
+            traj_file,
+            n_bins=25,
+            smooth_sigma=1.5,
+            output_dir=args.output_dir,
+            plot=True,
+            prepare_config=prepare_config,
+        )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+# Query for chat: I have a droplet detection algorithm for a gsd file obtained via hoomd, where the final state is a cuboid box with patchy particles and a polymer.
+# The patchy particles organize in a droplet around the polymer, but it's difficult to have an accurate detection. Is there a way to split the whole box into voxels
+# and get a density histogram such that I have 2 peaks (or almost 2 peaks), where one peak is the density outside the droplet, and the other peak is the density inside the droplet?
